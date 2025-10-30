@@ -1,1 +1,5 @@
-Flaskpython-telegram-bot==20.8requestsgunicornflask-cors
+Flask
+python-telegram-bot==20.8
+requests
+gunicorn
+flask-cors

@@ -281,6 +281,24 @@ def health():
         'messages': sum(len(m) for m in messages.values())
     })
 
+@app.route('/test-bot', methods=['GET'])
+def test_bot():
+    """Test if bot token is working"""
+    try:
+        url = f'{TELEGRAM_API}/getMe'
+        with urlopen(url, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return jsonify({
+                'success': result.get('ok', False),
+                'bot_info': result.get('result', {}),
+                'message': 'Bot is working!' if result.get('ok') else 'Bot token invalid'
+            })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 @app.route('/setup-webhook', methods=['GET'])
 def setup_webhook():
     """Setup Telegram webhook"""

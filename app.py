@@ -69,7 +69,8 @@ def send_message(chat_id, text):
     """Send text message to Telegram"""
     return telegram_request('sendMessage', {
         'chat_id': chat_id,
-        'text': text
+        'text': text,
+        'parse_mode': 'HTML'
     })
 
 # Routes
@@ -119,12 +120,13 @@ def send_msg():
         # Send to Telegram
         user = sessions[sid]
         text = (
-            f"💬 নতুন মেসেজ\n\n"
-            f"🆔 {sid}\n"
-            f"👤 {user['name']}\n"
-            f"📧 {user.get('email', 'N/A')}\n"
-            f"💭 {msg}\n\n"
-            f"📝 Reply: {sid}: আপনার মেসেজ"
+            f"💬 <b>নতুন মেসেজ</b>\n\n"
+            f"👤 <b>User:</b> {user['name']}\n"
+            f"📧 <b>Email:</b> {user.get('email', 'N/A')}\n"
+            f"💭 <b>Message:</b> {msg}\n\n"
+            f"📋 <b>Session ID:</b>\n"
+            f"<code>{sid}</code>\n\n"
+            f"📝 <i>Reply format:</i> <code>{sid}: Your message</code>"
         )
         
         # Send in background thread
@@ -174,12 +176,13 @@ def upload():
         # Notify admin
         user = sessions[sid]
         text = (
-            f"💬 নতুন মেসেজ (File)\n\n"
-            f"🆔 {sid}\n"
-            f"👤 {user['name']}\n"
-            f"📎 {file.filename}\n"
-            f"💭 {msg}\n\n"
-            f"📝 Reply: {sid}: আপনার মেসেজ"
+            f"💬 <b>নতুন মেসেজ (File)</b>\n\n"
+            f"👤 <b>User:</b> {user['name']}\n"
+            f"📎 <b>File:</b> {file.filename}\n"
+            f"💭 <b>Message:</b> {msg}\n\n"
+            f"📋 <b>Session ID:</b>\n"
+            f"<code>{sid}</code>\n\n"
+            f"📝 <i>Reply format:</i> <code>{sid}: Your message</code>"
         )
         
         from threading import Thread
@@ -280,19 +283,24 @@ def webhook():
             
             if text == '/start':
                 send_message(ADMIN_ID, 
-                    "✅ Bot Active!\n\n"
-                    "📝 Reply: SES_xxxxx: Message\n"
-                    "📊 Sessions: /sessions"
+                    "✅ <b>Bot Active!</b>\n\n"
+                    "🎯 <b>How to reply:</b>\n"
+                    "• Text reply: <code>SES_xxxxx: Message</code>\n"
+                    "• Photo: Send + caption <code>SES_xxxxx</code>\n"
+                    "• File: Send + caption <code>SES_xxxxx</code>\n\n"
+                    "📊 Check active sessions: /sessions\n\n"
+                    "💡 <i>Tip: Tap on session ID to copy</i>"
                 )
                 return jsonify({'ok': True})
             
             if text == '/sessions':
                 if not sessions:
-                    send_message(ADMIN_ID, "📭 No active sessions")
+                    send_message(ADMIN_ID, "📭 <b>No active sessions</b>")
                 else:
-                    msg = "📊 Active Sessions:\n\n"
+                    msg = "📊 <b>Active Sessions:</b>\n\n"
                     for s, d in list(sessions.items())[:10]:
-                        msg += f"🔹 {s}\n   {d['name']}\n\n"
+                        msg += f"🔹 <code>{s}</code>\n"
+                        msg += f"   👤 {d['name']}\n\n"
                     send_message(ADMIN_ID, msg)
                 return jsonify({'ok': True})
             
@@ -312,10 +320,10 @@ def webhook():
                         'timestamp': datetime.now().isoformat()
                     })
                     logger.info(f"Message added to session {sid}. Total messages: {len(messages[sid])}")
-                    send_message(ADMIN_ID, f"✅ Sent to {sid}")
+                    send_message(ADMIN_ID, f"✅ <b>Reply sent to:</b>\n<code>{sid}</code>")
                 else:
                     logger.warning(f"Session {sid} not found in {list(sessions.keys())}")
-                    send_message(ADMIN_ID, f"❌ {sid} not found")
+                    send_message(ADMIN_ID, f"❌ <b>Session not found:</b>\n<code>{sid}</code>")
         
         return jsonify({'ok': True})
     except Exception as e:

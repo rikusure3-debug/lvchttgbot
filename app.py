@@ -15,6 +15,7 @@ from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import requests
+import httpx  # httpx যোগ করা হয়েছে
 
 # --- কনফিগারেশন ---
 TELEGRAM_BOT_TOKEN = "8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A"  # আপনার বট টোকেন
@@ -70,21 +71,29 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             if session_id in visitor_connections:
                 try:
-                    # --- নতুন সমাধান: বট সার্ভারকে ইন্টারনাল HTTP রিকোয়েস্ট পাঠাবে ---
-                    # Render সাধারণত 10000 পোর্টে রান হয়
-                    port = os.environ.get('PORT', 10000) 
-                    url = f"http://127.0.0.1:{port}/internal-reply"
+                    # --- সমাধান: 127.0.0.1 এর বদলে Render-এর পাবলিক URL ব্যবহার ---
+                    render_url = os.environ.get('RENDER_EXTERNAL_URL')
                     
+                    if not render_url:
+                        # যদি Render URL না পায়, তবে লোকাল হোস্ট ব্যবহার (Render-এ এটি কাজ করবে না)
+                        logger.warning("RENDER_EXTERNAL_URL পাওয়া যায়নি, 127.0.0.1 ব্যবহার করা হচ্ছে।")
+                        port = os.environ.get('PORT', 10000) 
+                        url = f"http://127.0.0.1:{port}/internal-reply"
+                    else:
+                        # Render-এর দেওয়া পাবলিক URL ব্যবহার
+                        url = f"{render_url}/internal-reply"
+                    # --- /সমাধান ---
+
                     payload = {
                         "session_id": session_id,
                         "message": reply_text,
                         "api_key": app.config['INTERNAL_API_KEY'] # সিক্রেট কী
                     }
                     
-                    # বট নিজের সার্ভারকেই কল করছে
-                    requests.post(url, json=payload)
+                    async with httpx.AsyncClient() as client:
+                        await client.post(url, json=payload)
                     
-                    logger.info(f"মালিকের রিপ্লাই {session_id}-কে পাঠানোর জন্য ইন্টারনাল API কল করা হয়েছে।")
+                    logger.info(f"মালিকের রিপ্লাই {session_id}-কে পাঠানোর জন্য {url}-এ API কল করা হয়েছে।")
                 except Exception as e:
                     logger.error(f"ইন্টারনাল API কল করতে ব্যর্থ: {e}")
                     await update.message.reply_text(f"ত্রুটি: ভিজিটর {session_id} কে মেসেজ পাঠানো যায়নি (API Error)।")

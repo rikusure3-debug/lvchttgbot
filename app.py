@@ -257,6 +257,8 @@ def webhook():
                 sid = parts[0].strip()
                 reply = parts[1].strip() if len(parts) > 1 else ''
                 
+                logger.info(f"Processing reply - Session: {sid}, Reply: {reply}")
+                
                 if sid in sessions:
                     messages[sid].append({
                         'from': 'admin',
@@ -264,8 +266,10 @@ def webhook():
                         'type': 'text',
                         'timestamp': datetime.now().isoformat()
                     })
+                    logger.info(f"Message added to session {sid}. Total messages: {len(messages[sid])}")
                     send_message(ADMIN_ID, f"✅ Sent to {sid}")
                 else:
+                    logger.warning(f"Session {sid} not found in {list(sessions.keys())}")
                     send_message(ADMIN_ID, f"❌ {sid} not found")
         
         return jsonify({'ok': True})
@@ -344,6 +348,16 @@ def setup_webhook():
             'error': str(e),
             'webhook_url': f'https://{host}/api/chat/webhook'
         }), 500
+
+@app.route('/debug/session/<sid>', methods=['GET'])
+def debug_session(sid):
+    """Debug endpoint to check session data"""
+    return jsonify({
+        'session_exists': sid in sessions,
+        'session_data': sessions.get(sid, {}),
+        'message_count': len(messages.get(sid, [])),
+        'messages': messages.get(sid, [])
+    })
 
 @app.route('/webhook-info', methods=['GET'])
 def webhook_info():

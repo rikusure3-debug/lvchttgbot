@@ -17,6 +17,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 
 # --- কনফিগারেশন ---
+# অনুগ্রহ করে আপনার নতুন টোকেন এখানে ব্যবহার করুন
 TELEGRAM_BOT_TOKEN = "8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A"  # আপনার বট টোকেন
 OWNER_CHAT_ID = "2098068100"  # আপনার টেলিগ্রাম চ্যাট আইডি
 
@@ -25,11 +26,11 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app") # Gunicorn এর সাথে ভালো কাজ করার জন্য নাম "app" দিলাম
 
 # Flask এবং SocketIO অ্যাপ ইনিশিয়ালাইজেশন
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'render-app-secret-key!'
+app.config['SECRET_KEY'] = 'render-app-secret-key-123!'
 
 # --- CORS আপডেট ---
 # আমরা "*" এর বদলে শুধু আপনার ডোমেইনকে অনুমতি দিচ্ছি
@@ -71,13 +72,21 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             if session_id in visitor_connections:
                 try:
-                    socketio.emit('server_message', 
-                                  {'message': reply_text}, 
-                                  room=session_id)
-                    logger.info(f"মালিকের রিপ্লাই {session_id}-কে পাঠানো হয়েছে।")
+                    # --- সমাধান: asyncio কনফ্লিক্ট এড়ানোর জন্য ব্যাকগ্রাউন্ড টাস্ক ব্যবহার ---
+                    def send_reply(sid, text):
+                        # আমরা এই টাস্কের মধ্যে emit করছি
+                        socketio.emit('server_message', 
+                                      {'message': text}, 
+                                      room=sid)
+                    
+                    # SocketIO-কে বলছি এই টাস্কটি তার নিজের মতো করে চালাতে
+                    socketio.start_background_task(target=send_reply, sid=session_id, text=reply_text)
+                    # --- /সমাধান ---
+                    
+                    logger.info(f"মালিকের রিপ্লাই {session_id}-কে পাঠানোর জন্য টাস্ক চালু করা হয়েছে।")
                 except Exception as e:
-                    logger.error(f"SocketIO emit error: {e}")
-                    await update.message.reply_text(f"ত্রুটি: ভিজিটর {session_id} কে মেসেজ পাঠানো যায়নি।")
+                    logger.error(f"SocketIO background task শুরু করতে ব্যর্থ: {e}")
+                    await update.message.reply_text(f"ত্রুটি: ভিজিটর {session_id} কে মেসেজ পাঠানো যায়নি (Task Error)।")
             else:
                 await update.message.reply_text(f"ভিজিটর {session_id} অফলাইন হয়ে গেছেন। মেসেজ পাঠানো যায়নি।")
         else:
@@ -188,6 +197,7 @@ bot_thread.start()
 logger.info("টেলিগ্রাম বট থ্রেড সফলভাবে চালু হয়েছে।")
 
 # এই অংশটি শুধু লোকালভাবে 'python app.py' চালিয়ে টেস্ট করার জন্য
+# Render বা Gunicorn এই অংশটি ব্যবহার করে না
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"SocketIO সার্ভার {port} পোর্টে চালু হচ্ছে (লোকাল টেস্ট)...")

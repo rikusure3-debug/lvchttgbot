@@ -1,3 +1,10 @@
+# --- eventlet monkey patch ---
+# এটি অবশ্যই ফাইলের একদম শুরুতে থাকতে হবে
+# অন্য কোনো import (যেমন flask বা requests) এর আগে
+import eventlet
+eventlet.monkey_patch()
+
+# --- এখন অন্যান্য মডিউল ইম্পোর্ট করা যাবে ---
 import os
 import re
 import logging

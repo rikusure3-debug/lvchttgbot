@@ -303,27 +303,54 @@ def test_bot():
 def setup_webhook():
     """Setup Telegram webhook"""
     try:
-        webhook_url = request.host_url.rstrip('/') + '/api/chat/webhook'
+        # Get full webhook URL
+        webhook_url = request.url_root.rstrip('/') + '/api/chat/webhook'
         logger.info(f"Setting webhook to: {webhook_url}")
         
-        # Use simple GET request for webhook setup
-        url = f'{TELEGRAM_API}/setWebhook?url={webhook_url}'
+        # Delete existing webhook first
+        delete_url = f'{TELEGRAM_API}/deleteWebhook'
+        try:
+            with urlopen(delete_url, timeout=10) as response:
+                delete_result = json.loads(response.read().decode('utf-8'))
+                logger.info(f"Delete webhook: {delete_result}")
+        except Exception as e:
+            logger.warning(f"Delete webhook failed: {e}")
         
-        with urlopen(url, timeout=10) as response:
+        # Set new webhook - use GET with URL parameter
+        from urllib.parse import quote
+        encoded_webhook = quote(webhook_url, safe='')
+        set_url = f'{TELEGRAM_API}/setWebhook?url={encoded_webhook}'
+        
+        logger.info(f"Webhook URL (encoded): {set_url}")
+        
+        with urlopen(set_url, timeout=10) as response:
             result = json.loads(response.read().decode('utf-8'))
-            logger.info(f"Webhook result: {result}")
+            logger.info(f"Set webhook result: {result}")
+            
             return jsonify({
                 'success': result.get('ok', False),
                 'webhook_url': webhook_url,
+                'description': result.get('description', ''),
                 'result': result
             })
     except Exception as e:
-        logger.error(f"Webhook setup error: {e}")
+        logger.error(f"Webhook setup error: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e),
-            'webhook_url': request.host_url.rstrip('/') + '/api/chat/webhook'
+            'webhook_url': request.url_root.rstrip('/') + '/api/chat/webhook'
         }), 500
+
+@app.route('/webhook-info', methods=['GET'])
+def webhook_info():
+    """Get current webhook info"""
+    try:
+        url = f'{TELEGRAM_API}/getWebhookInfo'
+        with urlopen(url, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/')
 def index():
@@ -332,11 +359,19 @@ def index():
         'status': 'running',
         'endpoints': {
             'health': '/health',
-            'setup': '/setup-webhook',
-            'init': 'POST /api/chat/init',
-            'send': 'POST /api/chat/send',
-            'poll': 'GET /api/chat/poll/<session_id>'
-        }
+            'test_bot': '/test-bot - Test if bot token works',
+            'webhook_info': '/webhook-info - Check current webhook',
+            'setup_webhook': '/setup-webhook - Setup webhook for replies',
+            'init_chat': 'POST /api/chat/init',
+            'send_message': 'POST /api/chat/send',
+            'poll_messages': 'GET /api/chat/poll/<session_id>'
+        },
+        'setup_steps': [
+            '1. Visit /test-bot to verify bot token',
+            '2. Visit /setup-webhook to enable replies',
+            '3. Check /webhook-info to verify setup',
+            '4. Send /start to bot in Telegram'
+        ]
     })
 
 if __name__ == '__main__':

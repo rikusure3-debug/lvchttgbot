@@ -1,6 +1,1 @@
-Flask
-Flask-SocketIO
-python-telegram-bot==20.8
-requests
-gunicorn
-eventlet
+Flaskpython-telegram-bot==20.8requestsgunicornflask-cors

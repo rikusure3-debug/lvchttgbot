@@ -288,9 +288,45 @@ def webhook():
                     "• Text reply: <code>SES_xxxxx: Message</code>\n"
                     "• Photo: Send + caption <code>SES_xxxxx</code>\n"
                     "• File: Send + caption <code>SES_xxxxx</code>\n\n"
-                    "📊 Check active sessions: /sessions\n\n"
+                    "📊 Check active sessions: /sessions\n"
+                    "📖 Detailed help: /help\n"
+                    "🏓 Test bot: /ping\n\n"
                     "💡 <i>Tip: Tap on session ID to copy</i>"
                 )
+                return jsonify({'ok': True})
+            
+            if text == '/help':
+                help_text = (
+                    "📖 <b>Complete Help Guide</b>\n\n"
+                    "<b>🔹 Commands:</b>\n"
+                    "/start - Activate bot\n"
+                    "/sessions - List active chats\n"
+                    "/help - This guide\n"
+                    "/ping - Test response\n\n"
+                    "<b>🔹 Reply Format:</b>\n"
+                    "<code>SES_xxxxx: Your message</code>\n\n"
+                    "<b>Example:</b>\n"
+                    "<code>SES_20251030224346203: Hello! How can I help?</code>\n\n"
+                    "<b>🔹 Photo Reply:</b>\n"
+                    "1. Send photo\n"
+                    "2. Caption: <code>SES_xxxxx</code>\n\n"
+                    "<b>🔹 File Reply:</b>\n"
+                    "1. Send document\n"
+                    "2. Caption: <code>SES_xxxxx</code>\n\n"
+                    "<b>💡 Tips:</b>\n"
+                    "• Tap session ID to copy\n"
+                    "• Keep format exact\n"
+                    "• Check /sessions regularly"
+                )
+                send_message(ADMIN_ID, help_text)
+                return jsonify({'ok': True})
+            
+            if text == '/ping':
+                import time
+                start_time = time.time()
+                send_message(ADMIN_ID, "🏓 Pong!")
+                response_time = int((time.time() - start_time) * 1000)
+                send_message(ADMIN_ID, f"⚡ Response time: <code>{response_time}ms</code>\n\n🟢 Bot is working perfectly!")
                 return jsonify({'ok': True})
             
             if text == '/sessions':
@@ -301,6 +337,8 @@ def webhook():
                     for s, d in list(sessions.items())[:10]:
                         msg += f"🔹 <code>{s}</code>\n"
                         msg += f"   👤 {d['name']}\n\n"
+                    if len(sessions) > 10:
+                        msg += f"\n<i>... and {len(sessions) - 10} more</i>"
                     send_message(ADMIN_ID, msg)
                 return jsonify({'ok': True})
             

@@ -10,7 +10,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 
 # --- কনফিগারেশন ---
-# অনুগ্রহ করে আপনার নতুন টোকেন এখানে ব্যবহার করুন
 TELEGRAM_BOT_TOKEN = "8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A"  # আপনার বট টোকেন
 OWNER_CHAT_ID = "2098068100"  # আপনার টেলিগ্রাম চ্যাট আইডি
 
@@ -23,8 +22,18 @@ logger = logging.getLogger(__name__)
 
 # Flask এবং SocketIO অ্যাপ ইনিশিয়ালাইজেশন
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'render-app-secret-key!' # এটি পরিবর্তন করতে পারেন
-socketio = SocketIO(app, cors_allowed_origins="*")  # "*" মানে যেকোনো ডোমেইন থেকে কানেক্ট হতে পারবে
+app.config['SECRET_KEY'] = 'render-app-secret-key!'
+
+# --- CORS আপডেট ---
+# আমরা "*" এর বদলে শুধু আপনার ডোমেইনকে অনুমতি দিচ্ছি
+allowed_origins = [
+    "https://autouidtopup.com",
+    "http://autouidtopup.com",
+    "https://www.autouidtopup.com",
+    "http://www.autouidtopup.com"
+]
+socketio = SocketIO(app, cors_allowed_origins=allowed_origins)
+# --- /CORS আপডেট ---
 
 # ভিজিটরদের ট্র্যাক করার জন্য
 visitor_connections = {}

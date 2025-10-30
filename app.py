@@ -17,7 +17,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import requests
 
 # --- কনফিগারেশন ---
-# অনুগ্রহ করে আপনার নতুন টোকেন এখানে ব্যবহার করুন
 TELEGRAM_BOT_TOKEN = "8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A"  # আপনার বট টোকেন
 OWNER_CHAT_ID = "2098068100"  # আপনার টেলিগ্রাম চ্যাট আইডি
 
@@ -31,9 +30,9 @@ logger = logging.getLogger("app") # Gunicorn এর সাথে ভালো �
 # Flask এবং SocketIO অ্যাপ ইনিশিয়ালাইজেশন
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'render-app-secret-key-123!'
+app.config['INTERNAL_API_KEY'] = 'secr3t-key-f0r-internal-use' # একটি গোপন কী
 
 # --- CORS আপডেট ---
-# আমরা "*" এর বদলে শুধু আপনার ডোমেইনকে অনুমতি দিচ্ছি
 allowed_origins = [
     "https://autouidtopup.com",
     "http://autouidtopup.com",
@@ -41,7 +40,6 @@ allowed_origins = [
     "http://www.autouidtopup.com"
 ]
 socketio = SocketIO(app, cors_allowed_origins=allowed_origins)
-# --- /CORS আপডেট ---
 
 # ভিজিটরদের ট্র্যাক করার জন্য
 visitor_connections = {}
@@ -72,21 +70,24 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             if session_id in visitor_connections:
                 try:
-                    # --- সমাধান: asyncio কনফ্লিক্ট এড়ানোর জন্য ব্যাকগ্রাউন্ড টাস্ক ব্যবহার ---
-                    def send_reply(sid, text):
-                        # আমরা এই টাস্কের মধ্যে emit করছি
-                        socketio.emit('server_message', 
-                                      {'message': text}, 
-                                      room=sid)
+                    # --- নতুন সমাধান: বট সার্ভারকে ইন্টারনাল HTTP রিকোয়েস্ট পাঠাবে ---
+                    # Render সাধারণত 10000 পোর্টে রান হয়
+                    port = os.environ.get('PORT', 10000) 
+                    url = f"http://127.0.0.1:{port}/internal-reply"
                     
-                    # SocketIO-কে বলছি এই টাস্কটি তার নিজের মতো করে চালাতে
-                    socketio.start_background_task(target=send_reply, sid=session_id, text=reply_text)
-                    # --- /সমাধান ---
+                    payload = {
+                        "session_id": session_id,
+                        "message": reply_text,
+                        "api_key": app.config['INTERNAL_API_KEY'] # সিক্রেট কী
+                    }
                     
-                    logger.info(f"মালিকের রিপ্লাই {session_id}-কে পাঠানোর জন্য টাস্ক চালু করা হয়েছে।")
+                    # বট নিজের সার্ভারকেই কল করছে
+                    requests.post(url, json=payload)
+                    
+                    logger.info(f"মালিকের রিপ্লাই {session_id}-কে পাঠানোর জন্য ইন্টারনাল API কল করা হয়েছে।")
                 except Exception as e:
-                    logger.error(f"SocketIO background task শুরু করতে ব্যর্থ: {e}")
-                    await update.message.reply_text(f"ত্রুটি: ভিজিটর {session_id} কে মেসেজ পাঠানো যায়নি (Task Error)।")
+                    logger.error(f"ইন্টারনাল API কল করতে ব্যর্থ: {e}")
+                    await update.message.reply_text(f"ত্রুটি: ভিজিটর {session_id} কে মেসেজ পাঠানো যায়নি (API Error)।")
             else:
                 await update.message.reply_text(f"ভিজিটর {session_id} অফলাইন হয়ে গেছেন। মেসেজ পাঠানো যায়নি।")
         else:
@@ -96,44 +97,30 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def run_telegram_bot():
     """টেলিগ্রাম বটটি চালায়"""
-
-    # এই থ্রেডের জন্য একটি নতুন asyncio ইভেন্ট লুপ তৈরি করুন
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
-    
-    # অ্যাডমিনের রিপ্লাই হ্যান্ডল করার জন্য (সঠিক ফিল্টার সহ)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.REPLY & filters.Chat(chat_id=int(OWNER_CHAT_ID)), 
         handle_owner_reply
     ))
-    
-    # সাধারণ মেসেজ (যা রিপ্লাই নয়) হ্যান্ডল করার জন্য (সঠিক ফিল্টার সহ)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & ~filters.REPLY & filters.Chat(chat_id=int(OWNER_CHAT_ID)),
         handle_owner_reply 
     ))
-
     logger.info("টেলিগ্রাম বট পোলিং শুরু করছে...")
-    
-    # সিগন্যাল হ্যান্ডলিং বন্ধ করা হয়েছে (থ্রেডে চালানোর জন্য)
     application.run_polling(stop_signals=None)
-
 
 # --- Flask-SocketIO ইভেন্ট হ্যান্ডলার ---
 
 @socketio.on('connect')
 def handle_connect():
-    """যখন নতুন কোনো ভিজিটর ওয়েবসাইটে কানেক্ট হয়"""
     session_id = request.sid
     visitor_connections[session_id] = session_id
     join_room(session_id)
-    
     logger.info(f"নতুন ভিজিটর কানেক্ট হয়েছেন। সেশন আইডি: {session_id}")
-    
     try:
         message_text = f"✅ নতুন ভিজিটর অনলাইন।\n[Visitor: {session_id}]"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -142,18 +129,12 @@ def handle_connect():
     except Exception as e:
         logger.error(f"টেলিগ্রামে কানেকশন মেসেজ পাঠাতে ব্যর্থ: {e}")
 
-
 @socketio.on('visitor_message')
 def handle_visitor_message(data):
-    """যখন ভিজিটর ওয়েবসাইট থেকে মেসেজ পাঠায়"""
     session_id = request.sid
     message = data.get('message', '')
-    
-    if not message:
-        return
-        
+    if not message: return
     logger.info(f"ভিজিটর {session_id} মেসেজ পাঠিয়েছেন: {message}")
-    
     try:
         message_text = f"📩 [Visitor: {session_id}]\n\n{message}"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -164,14 +145,11 @@ def handle_visitor_message(data):
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """যখন ভিজিটর ওয়েবসাইট ডিসকানেক্ট করে"""
     session_id = request.sid
     if session_id in visitor_connections:
         leave_room(session_id)
         del visitor_connections[session_id]
-        
     logger.info(f"ভিজিটর ডিসকানেক্ট হয়েছেন। সেশন আইডি: {session_id}")
-    
     try:
         message_text = f"❌ ভিজিটর অফলাইন।\n[Visitor: {session_id}]"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -180,6 +158,33 @@ def handle_disconnect():
     except Exception as e:
         logger.error(f"টেলিগ্রামে ডিসকানেকশন মেসেজ পাঠাতে ব্যর্থ: {e}")
 
+# --- ইন্টারনাল রিপ্লাই পাঠানোর জন্য নতুন API রুট ---
+@app.route('/internal-reply', methods=['POST'])
+def internal_reply():
+    data = request.json
+    
+    # সিকিউরিটি চেক
+    if data.get('api_key') != app.config['INTERNAL_API_KEY']:
+        logger.warning("একটি ভুল API কী দিয়ে /internal-reply কল করার চেষ্টা করা হয়েছে।")
+        return {"status": "unauthorized"}, 401
+        
+    session_id = data.get('session_id')
+    message = data.get('message')
+    
+    if not session_id or message is None:
+        logger.error(f"/internal-reply কলে session_id বা message পাওয়া যায়নি।")
+        return {"status": "bad request"}, 400
+
+    try:
+        # এইবার আমরা সঠিক eventlet কনটেক্সট থেকে emit করছি
+        socketio.emit('server_message', 
+                      {'message': message}, 
+                      room=session_id)
+        logger.info(f"ইন্টারনাল API থেকে {session_id}-কে মেসেজ সফলভাবে পাঠানো হয়েছে।")
+        return {"status": "sent"}, 200
+    except Exception as e:
+        logger.error(f"API রুট থেকে socketio.emit করতে ব্যর্থ: {e}")
+        return {"status": "emit error"}, 500
 
 # --- Flask রুট (সার্ভার চেক করার জন্য) ---
 @app.route('/')
@@ -187,17 +192,12 @@ def index():
     return "লাইভ চ্যাট সার্ভার সফলভাবে চালু আছে এবং Render (gunicorn) দিয়ে চলছে।"
 
 # --- অ্যাপ চালু করা ---
-
-# টেলিগ্রাম বটকে একটি আলাদা থ্রেডে (Thread) চালানো
-# Gunicorn দিয়ে চালানোর জন্য আমরা এটিকে if-block-এর বাইরে নিয়ে এসেছি
 logger.info("টেলিগ্রাম বট থ্রেড চালু করা হচ্ছে...")
 bot_thread = Thread(target=run_telegram_bot)
 bot_thread.daemon = True
 bot_thread.start()
 logger.info("টেলিগ্রাম বট থ্রেড সফলভাবে চালু হয়েছে।")
 
-# এই অংশটি শুধু লোকালভাবে 'python app.py' চালিয়ে টেস্ট করার জন্য
-# Render বা Gunicorn এই অংশটি ব্যবহার করে না
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     logger.info(f"SocketIO সার্ভার {port} পোর্টে চালু হচ্ছে (লোকাল টেস্ট)...")

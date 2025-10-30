@@ -286,10 +286,26 @@ def setup_webhook():
     """Setup Telegram webhook"""
     try:
         webhook_url = request.host_url.rstrip('/') + '/api/chat/webhook'
-        result = telegram_request('setWebhook', {'url': webhook_url})
-        return jsonify(result if result else {'error': 'Failed'})
+        logger.info(f"Setting webhook to: {webhook_url}")
+        
+        # Use simple GET request for webhook setup
+        url = f'{TELEGRAM_API}/setWebhook?url={webhook_url}'
+        
+        with urlopen(url, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            logger.info(f"Webhook result: {result}")
+            return jsonify({
+                'success': result.get('ok', False),
+                'webhook_url': webhook_url,
+                'result': result
+            })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Webhook setup error: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'webhook_url': request.host_url.rstrip('/') + '/api/chat/webhook'
+        }), 500
 
 @app.route('/')
 def index():

@@ -1,15 +1,12 @@
 import os
-import asyncio
 import uuid
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import logging
 import base64
 import io
-from threading import Thread
+import requests
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -21,183 +18,31 @@ CORS(app)
 # Config
 BOT_TOKEN = '8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A'
 ADMIN_ID = '2098068100'
+TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 # Storage
 sessions = {}
 messages = {}
 files = {}
 
-# Bot
-bot = None
-telegram_app = None
-
-# Initialize bot
-def init_bot():
-    global bot, telegram_app
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    async def setup():
-        global bot, telegram_app
-        telegram_app = Application.builder().token(BOT_TOKEN).build()
-        bot = telegram_app.bot
-        
-        # Commands
-        async def start(update, context):
-            await update.message.reply_text(
-                "✅ Bot Active!\n\n"
-                "📝 Text reply: SES_xxxxx: Message\n"
-                "📷 Photo: Send photo + caption SES_xxxxx\n"
-                "📄 File: Send file + caption SES_xxxxx\n"
-                "📊 Sessions: /sessions"
-            )
-        
-        async def list_sessions(update, context):
-            if not sessions:
-                await update.message.reply_text("📭 No active sessions")
-                return
-            msg = "📊 Active Sessions:\n\n"
-            for sid, data in sessions.items():
-                msg += f"🔹 {sid}\n   User: {data['name']}\n\n"
-            await update.message.reply_text(msg)
-        
-        async def handle_text(update, context):
-            text = update.message.text
-            if ':' not in text:
-                await update.message.reply_text("⚠️ Format: SES_xxxxx: Your message")
-                return
-            
-            sid, msg = text.split(':', 1)
-            sid = sid.strip()
-            msg = msg.strip()
-            
-            if sid not in sessions:
-                await update.message.reply_text(f"❌ Session {sid} not found")
-                return
-            
-            messages[sid].append({
-                'from': 'admin',
-                'message': msg,
-                'type': 'text',
-                'timestamp': datetime.now().isoformat()
-            })
-            await update.message.reply_text(f"✅ Sent to {sid}")
-        
-        async def handle_photo(update, context):
-            caption = update.message.caption or ""
-            if 'SES_' not in caption:
-                await update.message.reply_text("⚠️ Caption e session ID dao")
-                return
-            
-            sid = caption.split(':')[0].strip() if ':' in caption else caption.strip()
-            
-            if sid not in sessions:
-                await update.message.reply_text(f"❌ Session not found")
-                return
-            
-            photo = update.message.photo[-1]
-            file = await photo.get_file()
-            file_bytes = await file.download_as_bytearray()
-            
-            fid = str(uuid.uuid4())
-            files[fid] = {
-                'data': base64.b64encode(file_bytes).decode(),
-                'mime': 'image/jpeg',
-                'name': f'photo_{fid}.jpg'
-            }
-            
-            messages[sid].append({
-                'from': 'admin',
-                'message': caption.split(':', 1)[1].strip() if ':' in caption else '',
-                'type': 'image',
-                'file_id': fid,
-                'timestamp': datetime.now().isoformat()
-            })
-            await update.message.reply_text(f"✅ Photo sent to {sid}")
-        
-        async def handle_doc(update, context):
-            caption = update.message.caption or ""
-            if 'SES_' not in caption:
-                await update.message.reply_text("⚠️ Caption e session ID dao")
-                return
-            
-            sid = caption.split(':')[0].strip() if ':' in caption else caption.strip()
-            
-            if sid not in sessions:
-                await update.message.reply_text(f"❌ Session not found")
-                return
-            
-            doc = update.message.document
-            file = await doc.get_file()
-            file_bytes = await file.download_as_bytearray()
-            
-            fid = str(uuid.uuid4())
-            files[fid] = {
-                'data': base64.b64encode(file_bytes).decode(),
-                'mime': doc.mime_type,
-                'name': doc.file_name
-            }
-            
-            messages[sid].append({
-                'from': 'admin',
-                'message': caption.split(':', 1)[1].strip() if ':' in caption else '',
-                'type': 'file',
-                'file_id': fid,
-                'filename': doc.file_name,
-                'timestamp': datetime.now().isoformat()
-            })
-            await update.message.reply_text(f"✅ File sent to {sid}")
-        
-        telegram_app.add_handler(CommandHandler("start", start))
-        telegram_app.add_handler(CommandHandler("sessions", list_sessions))
-        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-        telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-        telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-        
-        await telegram_app.initialize()
-        await telegram_app.start()
-        await telegram_app.updater.start_polling()
-        logger.info("✅ Bot started")
-    
-    loop.run_until_complete(setup())
-    loop.run_forever()
-
-# Send notification
-def notify_admin(sid, msg, user, file_data=None):
+# Send Telegram message using requests
+def send_telegram(chat_id, text, photo=None):
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        if photo:
+            url = f'{TELEGRAM_API}/sendPhoto'
+            files_data = {'photo': ('photo.jpg', photo, 'image/jpeg')}
+            data = {'chat_id': chat_id, 'caption': text}
+            response = requests.post(url, data=data, files=files_data)
+        else:
+            url = f'{TELEGRAM_API}/sendMessage'
+            data = {'chat_id': chat_id, 'text': text}
+            response = requests.post(url, json=data)
         
-        async def send():
-            text = (
-                f"💬 New Message\n\n"
-                f"🆔 {sid}\n"
-                f"👤 {user.get('name', 'Anonymous')}\n"
-                f"📧 {user.get('email', 'N/A')}\n"
-            )
-            
-            if file_data:
-                text += f"📎 {file_data.get('name', 'file')}\n"
-            if msg:
-                text += f"💭 {msg}\n"
-            
-            text += f"\n📝 Reply: {sid}: Your message"
-            
-            if file_data:
-                file_bytes = io.BytesIO(base64.b64decode(file_data['data']))
-                file_bytes.name = file_data['name']
-                
-                if file_data['mime'].startswith('image/'):
-                    await bot.send_photo(chat_id=ADMIN_ID, photo=file_bytes, caption=text)
-                else:
-                    await bot.send_document(chat_id=ADMIN_ID, document=file_bytes, caption=text)
-            else:
-                await bot.send_message(chat_id=ADMIN_ID, text=text)
-        
-        loop.run_until_complete(send())
-        loop.close()
+        logger.info(f"Telegram response: {response.status_code}")
+        return response.json()
     except Exception as e:
-        logger.error(f"Notification error: {e}")
+        logger.error(f"Telegram error: {e}")
+        return None
 
 # Routes
 @app.route('/api/chat/init', methods=['POST'])
@@ -212,6 +57,7 @@ def init_chat():
     }
     messages[sid] = []
     
+    logger.info(f"New session: {sid}")
     return jsonify({'success': True, 'session_id': sid})
 
 @app.route('/api/chat/send', methods=['POST'])
@@ -231,9 +77,19 @@ def send_msg():
             'timestamp': datetime.now().isoformat()
         })
         
-        # Notify in background
-        Thread(target=notify_admin, args=(sid, msg, sessions[sid])).start()
+        # Send to Telegram
+        user = sessions[sid]
+        text = (
+            f"💬 নতুন মেসেজ\n\n"
+            f"🆔 Session: {sid}\n"
+            f"👤 User: {user['name']}\n"
+            f"📧 Email: {user.get('email', 'N/A')}\n"
+            f"💭 Message: {msg}\n\n"
+            f"📝 Reply করতে: {sid}: আপনার মেসেজ"
+        )
+        send_telegram(ADMIN_ID, text)
         
+        logger.info(f"Message sent from {sid}")
         return jsonify({'success': True})
     except Exception as e:
         logger.error(f"Send error: {e}")
@@ -273,9 +129,23 @@ def upload():
             'timestamp': datetime.now().isoformat()
         })
         
-        # Notify in background
-        Thread(target=notify_admin, args=(sid, msg, sessions[sid], file_data)).start()
+        # Send to Telegram
+        user = sessions[sid]
+        text = (
+            f"💬 নতুন মেসেজ (File)\n\n"
+            f"🆔 Session: {sid}\n"
+            f"👤 User: {user['name']}\n"
+            f"📎 File: {file.filename}\n"
+            f"💭 Message: {msg}\n\n"
+            f"📝 Reply করতে: {sid}: আপনার মেসেজ"
+        )
         
+        if msg_type == 'image':
+            send_telegram(ADMIN_ID, text, io.BytesIO(file_bytes))
+        else:
+            send_telegram(ADMIN_ID, text)
+        
+        logger.info(f"File uploaded from {sid}")
         return jsonify({'success': True, 'file_id': fid})
     except Exception as e:
         logger.error(f"Upload error: {e}")
@@ -310,19 +180,119 @@ def poll(sid):
         'total_count': len(msgs)
     })
 
+@app.route('/api/chat/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook for receiving replies"""
+    try:
+        data = request.json
+        logger.info(f"Webhook received: {data}")
+        
+        if 'message' not in data:
+            return jsonify({'ok': True})
+        
+        message = data['message']
+        chat_id = str(message['chat']['id'])
+        
+        # Only process admin messages
+        if chat_id != ADMIN_ID:
+            return jsonify({'ok': True})
+        
+        # Handle text reply
+        if 'text' in message:
+            text = message['text']
+            
+            # Commands
+            if text == '/start':
+                send_telegram(ADMIN_ID, 
+                    "✅ Bot Active!\n\n"
+                    "📝 Text reply: SES_xxxxx: Message\n"
+                    "📷 Photo: Send + caption SES_xxxxx\n"
+                    "📄 File: Send + caption SES_xxxxx\n"
+                    "📊 Sessions: /sessions"
+                )
+                return jsonify({'ok': True})
+            
+            if text == '/sessions':
+                if not sessions:
+                    send_telegram(ADMIN_ID, "📭 No active sessions")
+                else:
+                    msg = "📊 Active Sessions:\n\n"
+                    for sid, data in sessions.items():
+                        msg += f"🔹 {sid}\n   User: {data['name']}\n\n"
+                    send_telegram(ADMIN_ID, msg)
+                return jsonify({'ok': True})
+            
+            # Reply to session
+            if ':' in text:
+                sid, reply = text.split(':', 1)
+                sid = sid.strip()
+                reply = reply.strip()
+                
+                if sid in sessions:
+                    messages[sid].append({
+                        'from': 'admin',
+                        'message': reply,
+                        'type': 'text',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    send_telegram(ADMIN_ID, f"✅ Reply sent to {sid}")
+                else:
+                    send_telegram(ADMIN_ID, f"❌ Session {sid} not found")
+        
+        # Handle photo reply
+        elif 'photo' in message:
+            caption = message.get('caption', '')
+            if 'SES_' in caption:
+                sid = caption.split(':')[0].strip() if ':' in caption else caption.strip()
+                
+                if sid in sessions:
+                    # Get photo
+                    photo = message['photo'][-1]
+                    file_id = photo['file_id']
+                    
+                    # Download photo
+                    file_info = requests.get(f'{TELEGRAM_API}/getFile?file_id={file_id}').json()
+                    if file_info['ok']:
+                        file_path = file_info['result']['file_path']
+                        file_url = f'https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}'
+                        photo_bytes = requests.get(file_url).content
+                        
+                        # Store photo
+                        fid = str(uuid.uuid4())
+                        files[fid] = {
+                            'data': base64.b64encode(photo_bytes).decode(),
+                            'mime': 'image/jpeg',
+                            'name': f'photo_{fid}.jpg'
+                        }
+                        
+                        messages[sid].append({
+                            'from': 'admin',
+                            'message': caption.split(':', 1)[1].strip() if ':' in caption else '',
+                            'type': 'image',
+                            'file_id': fid,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        send_telegram(ADMIN_ID, f"✅ Photo sent to {sid}")
+                else:
+                    send_telegram(ADMIN_ID, f"❌ Session not found")
+        
+        return jsonify({'ok': True})
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy', 'bot': bot is not None})
+    return jsonify({'status': 'healthy', 'bot_token': BOT_TOKEN[:10] + '...'})
+
+@app.route('/setup-webhook', methods=['GET'])
+def setup_webhook():
+    """Setup webhook - call this once after deploy"""
+    webhook_url = request.host_url + 'api/chat/webhook'
+    url = f'{TELEGRAM_API}/setWebhook?url={webhook_url}'
+    response = requests.get(url)
+    return jsonify(response.json())
 
 if __name__ == '__main__':
-    # Start bot in background
-    bot_thread = Thread(target=init_bot, daemon=True)
-    bot_thread.start()
-    
-    # Wait for bot
-    import time
-    time.sleep(3)
-    
-    # Start Flask
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)

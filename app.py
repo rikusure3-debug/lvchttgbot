@@ -303,8 +303,10 @@ def test_bot():
 def setup_webhook():
     """Setup Telegram webhook"""
     try:
-        # Get full webhook URL
-        webhook_url = request.url_root.rstrip('/') + '/api/chat/webhook'
+        # Force HTTPS for webhook URL (Render always uses HTTPS)
+        host = request.host
+        webhook_url = f'https://{host}/api/chat/webhook'
+        
         logger.info(f"Setting webhook to: {webhook_url}")
         
         # Delete existing webhook first
@@ -316,12 +318,12 @@ def setup_webhook():
         except Exception as e:
             logger.warning(f"Delete webhook failed: {e}")
         
-        # Set new webhook - use GET with URL parameter
-        from urllib.parse import quote
-        encoded_webhook = quote(webhook_url, safe='')
-        set_url = f'{TELEGRAM_API}/setWebhook?url={encoded_webhook}'
+        # Set new webhook
+        from urllib.parse import urlencode
+        params = urlencode({'url': webhook_url})
+        set_url = f'{TELEGRAM_API}/setWebhook?{params}'
         
-        logger.info(f"Webhook URL (encoded): {set_url}")
+        logger.info(f"Making request to: {set_url}")
         
         with urlopen(set_url, timeout=10) as response:
             result = json.loads(response.read().decode('utf-8'))
@@ -331,14 +333,16 @@ def setup_webhook():
                 'success': result.get('ok', False),
                 'webhook_url': webhook_url,
                 'description': result.get('description', ''),
+                'error': result.get('description') if not result.get('ok') else None,
                 'result': result
             })
     except Exception as e:
         logger.error(f"Webhook setup error: {e}", exc_info=True)
+        host = request.host
         return jsonify({
             'success': False,
             'error': str(e),
-            'webhook_url': request.url_root.rstrip('/') + '/api/chat/webhook'
+            'webhook_url': f'https://{host}/api/chat/webhook'
         }), 500
 
 @app.route('/webhook-info', methods=['GET'])

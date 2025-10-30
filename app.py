@@ -3,7 +3,7 @@ import uuid
 import json
 import base64
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen, Request
 from flask import Flask, request, jsonify, send_file
@@ -26,6 +26,25 @@ TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
 sessions = {}
 messages = {}
 files = {}
+
+# Session cleanup - remove old sessions (older than 24 hours)
+def cleanup_old_sessions():
+    try:
+        cutoff = datetime.now() - timedelta(hours=24)
+        to_remove = []
+        for sid, data in sessions.items():
+            started = datetime.fromisoformat(data['started'])
+            if started < cutoff:
+                to_remove.append(sid)
+        
+        for sid in to_remove:
+            if sid in sessions:
+                del sessions[sid]
+            if sid in messages:
+                del messages[sid]
+            logger.info(f"Cleaned up old session: {sid}")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
 
 def telegram_request(method, data=None):
     """Make Telegram API request using urllib"""
@@ -62,12 +81,23 @@ def init_chat():
     sessions[sid] = {
         'name': data.get('name', 'Anonymous'),
         'email': data.get('email', ''),
-        'started': datetime.now().isoformat()
+        'started': datetime.now().isoformat(),
+        'last_active': datetime.now().isoformat()
     }
     messages[sid] = []
     
-    logger.info(f"New session: {sid}")
-    return jsonify({'success': True, 'session_id': sid})
+    # Run cleanup in background
+    import threading
+    threading.Thread(target=cleanup_old_sessions, daemon=True).start()
+    
+    logger.info(f"New session created: {sid} - User: {sessions[sid]['name']}")
+    logger.info(f"Active sessions: {len(sessions)}")
+    
+    return jsonify({
+        'success': True,
+        'session_id': sid,
+        'message': 'Session created successfully'
+    })
 
 @app.route('/api/chat/send', methods=['POST'])
 def send_msg():
@@ -178,16 +208,31 @@ def get_file(fid):
 
 @app.route('/api/chat/poll/<sid>', methods=['GET'])
 def poll(sid):
-    if sid not in sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'}), 400
+    # Update last active time
+    if sid in sessions:
+        sessions[sid]['last_active'] = datetime.now().isoformat()
+    else:
+        logger.warning(f"Poll attempt for non-existent session: {sid}")
+        logger.info(f"Current active sessions: {list(sessions.keys())}")
+        return jsonify({
+            'success': False,
+            'error': 'Session expired or invalid. Please refresh and start a new chat.',
+            'code': 'SESSION_NOT_FOUND'
+        }), 404
     
     last = int(request.args.get('last_count', 0))
     msgs = messages.get(sid, [])
     
+    new_msgs = msgs[last:]
+    
+    if new_msgs:
+        logger.info(f"Returning {len(new_msgs)} new messages for {sid}")
+    
     return jsonify({
         'success': True,
-        'messages': msgs[last:],
-        'total_count': len(msgs)
+        'messages': new_msgs,
+        'total_count': len(msgs),
+        'session_active': True
     })
 
 @app.route('/api/chat/reply', methods=['POST'])
@@ -281,8 +326,10 @@ def webhook():
 def health():
     return jsonify({
         'status': 'healthy',
-        'sessions': len(sessions),
-        'messages': sum(len(m) for m in messages.values())
+        'active_sessions': len(sessions),
+        'total_messages': sum(len(m) for m in messages.values()),
+        'uptime': 'running',
+        'session_ids': list(sessions.keys()) if len(sessions) < 10 else f"{len(sessions)} active"
     })
 
 @app.route('/test-bot', methods=['GET'])
@@ -356,7 +403,10 @@ def debug_session(sid):
         'session_exists': sid in sessions,
         'session_data': sessions.get(sid, {}),
         'message_count': len(messages.get(sid, [])),
-        'messages': messages.get(sid, [])
+        'messages': messages.get(sid, []),
+        'all_active_sessions': list(sessions.keys()),
+        'server_time': datetime.now().isoformat(),
+        'help': 'If session_exists is false, create a new chat session'
     })
 
 @app.route('/webhook-info', methods=['GET'])

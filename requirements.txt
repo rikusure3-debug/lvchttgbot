@@ -1,3 +1,4 @@
 Flask==3.0.0
-flask-cors==4.0.0
-python-telegram-bot==21.5
+pyTelegramBotAPI==4.14.0
+PyGithub==2.1.1
+requests==2.31.0

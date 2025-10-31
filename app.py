@@ -9,12 +9,14 @@ import telebot
 from telebot import types
 from github import Github, BadCredentialsException
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import atexit
 
 # ======================
 # CONFIG
 # ======================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") 
+SESSION_FILE = "bot_sessions.json"
 
 if not BOT_TOKEN:
     raise SystemExit("❗ BOT_TOKEN environment variable not found!")
@@ -26,12 +28,71 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode='Markdown')
 sessions = {}
 
 # =================================================
+# SESSION PERSISTENCE FUNCTIONS
+# =================================================
+def load_sessions():
+    """Load sessions from file on startup"""
+    global sessions
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, 'r') as f:
+                data = json.load(f)
+                # Convert string keys back to integers
+                sessions = {int(k): v for k, v in data.items()}
+            print(f"✅ Loaded {len(sessions)} sessions from file")
+    except Exception as e:
+        print(f"⚠️ Could not load sessions: {e}")
+        sessions = {}
+
+def save_sessions():
+    """Save sessions to file"""
+    try:
+        # Remove github_client objects as they can't be serialized
+        saveable_sessions = {}
+        for chat_id, sess in sessions.items():
+            clean_sess = {k: v for k, v in sess.items() 
+                         if k not in ['github_client', 'repo', 'repos']}
+            saveable_sessions[str(chat_id)] = clean_sess
+        
+        with open(SESSION_FILE, 'w') as f:
+            json.dump(saveable_sessions, f, indent=2)
+        print(f"💾 Saved {len(saveable_sessions)} sessions")
+    except Exception as e:
+        print(f"⚠️ Could not save sessions: {e}")
+
+def auto_save_sessions():
+    """Periodically save sessions every 5 minutes"""
+    while True:
+        time.sleep(300)  # 5 minutes
+        save_sessions()
+
+# Load sessions on startup
+load_sessions()
+
+# Start auto-save thread
+save_thread = threading.Thread(target=auto_save_sessions, daemon=True)
+save_thread.start()
+
+# Save sessions on exit
+atexit.register(save_sessions)
+
+# =================================================
 # UTILITY FUNCTIONS (All 3 bots combined)
 # =================================================
 def get_session(chat_id):
     """Return or create a user session."""
     if chat_id not in sessions:
         sessions[chat_id] = {"step": None}
+    
+    # Restore GitHub client if token exists but client doesn't
+    sess = sessions[chat_id]
+    if sess.get("github_token") and not sess.get("github_client"):
+        try:
+            sess["github_client"] = Github(sess["github_token"])
+            print(f"♻️ Restored GitHub client for user {chat_id}")
+        except Exception as e:
+            print(f"⚠️ Could not restore GitHub client: {e}")
+    
     return sessions[chat_id]
 
 # --- GitHub Editor Utilities ---
@@ -125,23 +186,52 @@ def extract_uid_password_pairs(text: str):
 # =================================================
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
+    chat_id = message.chat.id
+    sess = get_session(chat_id)
+    
     markup = types.InlineKeyboardMarkup(row_width=1)
     btn_github = types.InlineKeyboardButton("🐙 GitHub Editor", callback_data="github_start")
     btn_jwt = types.InlineKeyboardButton("🔑 JWT Generator", callback_data="jwt_generator_start")
     btn_json = types.InlineKeyboardButton("⚙️ JSON Converter", callback_data="json_converter_start")
     markup.add(btn_github, btn_jwt, btn_json)
     
-    bot.send_message(
-        message.chat.id,
-        "👋 *Welcome to your 3-in-1 Super-Bot!*\n\n"
-        "Please choose a task from the menu:",
-        reply_markup=markup
-    )
+    welcome_text = "👋 *Welcome to your 3-in-1 Super-Bot!*\n\n"
+    
+    # Show if session was restored
+    if sess.get("github_token"):
+        welcome_text += "♻️ _Your GitHub session has been restored!_\n\n"
+    
+    welcome_text += "Please choose a task from the menu:"
+    
+    bot.send_message(chat_id, welcome_text, reply_markup=markup)
 
 @bot.message_handler(commands=['cancel'])
 def cmd_cancel(message):
     sessions.pop(message.chat.id, None)
+    save_sessions()  # Save after clearing session
     bot.send_message(message.chat.id, "✅ Operation cancelled. Press /start to see the menu.")
+
+@bot.message_handler(commands=['status'])
+def cmd_status(message):
+    """Show current session status"""
+    chat_id = message.chat.id
+    sess = get_session(chat_id)
+    
+    status_text = "📊 *Your Session Status:*\n\n"
+    
+    if sess.get("github_token"):
+        status_text += "🐙 *GitHub:* Connected ✅\n"
+    else:
+        status_text += "🐙 *GitHub:* Not connected ❌\n"
+    
+    if sess.get("step"):
+        status_text += f"📍 *Current Step:* `{sess['step']}`\n"
+    else:
+        status_text += "📍 *Current Step:* Idle\n"
+    
+    status_text += f"\n💾 Sessions will persist across restarts!"
+    
+    bot.send_message(chat_id, status_text)
 
 # =================================================
 # CALLBACK HANDLER (Handles button clicks)
@@ -210,6 +300,7 @@ def handle_text(message):
             github_client = Github(text)
             github_client.get_user().login
             sess.update({"github_token": text, "github_client": github_client, "step": None})
+            save_sessions()  # Save after token is stored
             bot.send_message(chat_id, "✅ GitHub token saved! Now listing repositories...")
             list_github_repos(message)
         except Exception as e:

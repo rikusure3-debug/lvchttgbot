@@ -285,24 +285,32 @@ def webhook():
                 send_message(ADMIN_ID, 
                     "✅ <b>Bot Active!</b>\n\n"
                     "🎯 <b>How to reply:</b>\n"
-                    "• Text reply: <code>SES_xxxxx: Message</code>\n"
+                    "• Text: <code>SES_xxxxx: Message</code>\n"
                     "• Photo: Send + caption <code>SES_xxxxx</code>\n"
                     "• File: Send + caption <code>SES_xxxxx</code>\n\n"
-                    "📊 Check active sessions: /sessions\n"
-                    "📖 Detailed help: /help\n"
-                    "🏓 Test bot: /ping\n\n"
-                    "💡 <i>Tip: Tap on session ID to copy</i>"
+                    "📋 <b>Commands:</b>\n"
+                    "/sessions - Active chats\n"
+                    "/session &lt;id&gt; - Session details\n"
+                    "/close &lt;id&gt; - Close session\n"
+                    "/broadcast - Message all\n"
+                    "/help - Full guide\n"
+                    "/ping - Test bot\n\n"
+                    "💡 <i>Tip: Tap session ID to copy</i>"
                 )
                 return jsonify({'ok': True})
             
             if text == '/help':
                 help_text = (
                     "📖 <b>Complete Help Guide</b>\n\n"
-                    "<b>🔹 Commands:</b>\n"
+                    "<b>🔹 Basic Commands:</b>\n"
                     "/start - Activate bot\n"
                     "/sessions - List active chats\n"
                     "/help - This guide\n"
                     "/ping - Test response\n\n"
+                    "<b>🔹 Advanced Commands:</b>\n"
+                    "/session &lt;id&gt; - View session details\n"
+                    "/close &lt;id&gt; - Close session\n"
+                    "/broadcast &lt;msg&gt; - Send to all\n\n"
                     "<b>🔹 Reply Format:</b>\n"
                     "<code>SES_xxxxx: Your message</code>\n\n"
                     "<b>Example:</b>\n"
@@ -315,8 +323,9 @@ def webhook():
                     "2. Caption: <code>SES_xxxxx</code>\n\n"
                     "<b>💡 Tips:</b>\n"
                     "• Tap session ID to copy\n"
-                    "• Keep format exact\n"
-                    "• Check /sessions regularly"
+                    "• Use /session to check details\n"
+                    "• Use /close to end chat\n"
+                    "• Use /broadcast for announcements"
                 )
                 send_message(ADMIN_ID, help_text)
                 return jsonify({'ok': True})
@@ -340,6 +349,96 @@ def webhook():
                     if len(sessions) > 10:
                         msg += f"\n<i>... and {len(sessions) - 10} more</i>"
                     send_message(ADMIN_ID, msg)
+                return jsonify({'ok': True})
+            
+            # /session command - View specific session details
+            if text.startswith('/session '):
+                sid = text.replace('/session ', '').strip()
+                
+                if sid not in sessions:
+                    send_message(ADMIN_ID, f"❌ <b>Session not found:</b>\n<code>{sid}</code>")
+                else:
+                    session_data = sessions[sid]
+                    session_messages = messages.get(sid, [])
+                    
+                    started_time = datetime.fromisoformat(session_data['started'])
+                    time_diff = datetime.now() - started_time
+                    hours = int(time_diff.total_seconds() // 3600)
+                    minutes = int((time_diff.total_seconds() % 3600) // 60)
+                    
+                    msg = (
+                        f"📋 <b>Session Details</b>\n\n"
+                        f"🆔 <code>{sid}</code>\n"
+                        f"👤 <b>User:</b> {session_data['name']}\n"
+                        f"📧 <b>Email:</b> {session_data.get('email', 'N/A')}\n"
+                        f"⏰ <b>Started:</b> {started_time.strftime('%I:%M %p')}\n"
+                        f"⏱️ <b>Duration:</b> {hours}h {minutes}m\n"
+                        f"💬 <b>Messages:</b> {len(session_messages)}\n"
+                        f"📌 <b>Status:</b> Active\n\n"
+                        f"<i>Reply format:</i> <code>{sid}: Your message</code>"
+                    )
+                    send_message(ADMIN_ID, msg)
+                return jsonify({'ok': True})
+            
+            # /close command - Close a specific session
+            if text.startswith('/close '):
+                sid = text.replace('/close ', '').strip()
+                
+                if sid not in sessions:
+                    send_message(ADMIN_ID, f"❌ <b>Session not found:</b>\n<code>{sid}</code>")
+                else:
+                    user_name = sessions[sid]['name']
+                    
+                    # Send closing message to visitor
+                    if sid in messages:
+                        messages[sid].append({
+                            'from': 'admin',
+                            'message': '⚠️ এই চ্যাট সেশন বন্ধ করা হয়েছে। নতুন চ্যাট শুরু করতে পেজ রিফ্রেশ করুন।',
+                            'type': 'text',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                    
+                    # Remove session
+                    del sessions[sid]
+                    logger.info(f"Session {sid} closed by admin")
+                    
+                    send_message(ADMIN_ID, 
+                        f"✅ <b>Session Closed</b>\n\n"
+                        f"🆔 <code>{sid}</code>\n"
+                        f"👤 User: {user_name}\n"
+                        f"📢 User will be notified"
+                    )
+                return jsonify({'ok': True})
+            
+            # /broadcast command - Send message to all active sessions
+            if text.startswith('/broadcast '):
+                broadcast_msg = text.replace('/broadcast ', '').strip()
+                
+                if not broadcast_msg:
+                    send_message(ADMIN_ID, "⚠️ <b>Usage:</b> <code>/broadcast Your message</code>")
+                    return jsonify({'ok': True})
+                
+                if not sessions:
+                    send_message(ADMIN_ID, "📭 <b>No active sessions</b>")
+                    return jsonify({'ok': True})
+                
+                # Send to all sessions
+                sent_count = 0
+                for sid in list(sessions.keys()):
+                    if sid in messages:
+                        messages[sid].append({
+                            'from': 'admin',
+                            'message': f"📢 <b>Announcement:</b> {broadcast_msg}",
+                            'type': 'text',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        sent_count += 1
+                
+                send_message(ADMIN_ID,
+                    f"📢 <b>Broadcast Sent!</b>\n\n"
+                    f"✅ Delivered to {sent_count} active session(s)\n"
+                    f"💬 Message: {broadcast_msg}"
+                )
                 return jsonify({'ok': True})
             
             # Reply to visitor

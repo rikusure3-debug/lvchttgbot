@@ -14,13 +14,19 @@ import atexit
 # ======================
 # CONFIG
 # ======================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") 
 SESSION_FILE = "bot_sessions.json"
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # Admin's Telegram Chat ID
 
 if not BOT_TOKEN:
-    raise SystemExit("❗ BOT_TOKEN environment variable not found!")
+    raise SystemExit("❗ BOT_TOKEN or TELEGRAM_BOT_TOKEN environment variable not found!")
+
+# Show which variable was used
+if os.environ.get("BOT_TOKEN"):
+    print("✅ Using BOT_TOKEN environment variable")
+elif os.environ.get("TELEGRAM_BOT_TOKEN"):
+    print("✅ Using TELEGRAM_BOT_TOKEN environment variable")
 
 # Convert ADMIN_CHAT_ID to integer if provided
 if ADMIN_CHAT_ID:

@@ -1,593 +1,521 @@
 import os
+import asyncio
 import uuid
-import json
-import base64
-import io
-from datetime import datetime, timedelta
-from urllib.parse import urlencode
-from urllib.request import urlopen, Request
+from datetime import datetime
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from telegram import Update, Bot, InputFile
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import logging
+import base64
+import io
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# Config
-BOT_TOKEN = '8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A'
-ADMIN_ID = '2098068100'
-TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
+# Configuration
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A')
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID', '2098068100')
 
-# Storage
-sessions = {}
-messages = {}
-files = {}
+# In-memory storage (use Redis/Database for production)
+active_sessions = {}  # {session_id: {user_data}}
+message_queue = {}  # {session_id: [messages]}
+file_storage = {}  # {file_id: file_data}
 
-# Session cleanup - remove old sessions (older than 24 hours)
-def cleanup_old_sessions():
-    try:
-        cutoff = datetime.now() - timedelta(hours=24)
-        to_remove = []
-        for sid, data in sessions.items():
-            started = datetime.fromisoformat(data['started'])
-            if started < cutoff:
-                to_remove.append(sid)
-        
-        for sid in to_remove:
-            if sid in sessions:
-                del sessions[sid]
-            if sid in messages:
-                del messages[sid]
-            logger.info(f"Cleaned up old session: {sid}")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
+# Initialize Telegram Bot
+telegram_app = None
+bot = None
 
-def telegram_request(method, data=None):
-    """Make Telegram API request using urllib"""
-    try:
-        url = f'{TELEGRAM_API}/{method}'
-        
-        if data:
-            data_encoded = json.dumps(data).encode('utf-8')
-            req = Request(url, data=data_encoded, headers={'Content-Type': 'application/json'})
-        else:
-            req = Request(url)
-        
-        with urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            logger.info(f"Telegram {method}: {result.get('ok', False)}")
-            return result
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
-        return None
+async def init_telegram_bot():
+    """Initialize Telegram bot"""
+    global telegram_app, bot
+    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    bot = telegram_app.bot
+    
+    # Add handlers
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("sessions", list_sessions))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_reply))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_admin_photo))
+    telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_document))
+    telegram_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_admin_voice))  # ✅ Voice handler added
+    
+    # Start bot
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()
+    logger.info("✅ Telegram bot started successfully")
 
-def send_message(chat_id, text):
-    """Send text message to Telegram"""
-    return telegram_request('sendMessage', {
-        'chat_id': chat_id,
-        'text': text,
-        'parse_mode': 'HTML'
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    await update.message.reply_text(
+        "✅ Live Chat Bot Active!\n\n"
+        "🔹 Visitor message korle notification ashbe\n"
+        "🔹 Text reply: SES_xxxxx: Tumhar message\n"
+        "🔹 Photo/File/Voice reply: Media pathao + caption e SES_xxxxx likho\n"
+        "🔹 Active sessions: /sessions"
+    )
+
+async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all active sessions"""
+    if not active_sessions:
+        await update.message.reply_text("🔭 Kono active session nei")
+        return
+    
+    message = "📊 Active Sessions:\n\n"
+    for session_id, data in active_sessions.items():
+        message += f"🔹 {session_id}\n"
+        message += f"   Name: {data.get('name', 'Unknown')}\n"
+        message += f"   Started: {data.get('started_at', 'Unknown')}\n"
+        message += f"   Messages: {len(message_queue.get(session_id, []))}\n\n"
+    
+    await update.message.reply_text(message)
+
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin's text reply to customer"""
+    text = update.message.text
+    
+    # Check if message contains session ID
+    if ':' not in text:
+        await update.message.reply_text(
+            "⚠️ Format: SES_xxxxx: Tumhar message\n"
+            "Example: SES_12345: Hello, how can I help?"
+        )
+        return
+    
+    session_id, reply_message = text.split(':', 1)
+    session_id = session_id.strip()
+    reply_message = reply_message.strip()
+    
+    if session_id not in active_sessions:
+        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
+        return
+    
+    # Store admin reply
+    if session_id not in message_queue:
+        message_queue[session_id] = []
+    
+    message_queue[session_id].append({
+        'from': 'admin',
+        'message': reply_message,
+        'type': 'text',
+        'timestamp': datetime.now().isoformat()
     })
+    
+    await update.message.reply_text(f"✅ Reply sent to {session_id}")
 
-# Routes
+async def handle_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin's photo reply - FIXED VERSION"""
+    caption = update.message.caption or ""
+    
+    if ':' not in caption and 'SES_' not in caption:
+        await update.message.reply_text(
+            "⚠️ Caption e session ID dao\n"
+            "Example: SES_12345: Check this image"
+        )
+        return
+    
+    # Extract session ID
+    session_id = caption.split(':')[0].strip() if ':' in caption else caption.strip()
+    message_text = caption.split(':', 1)[1].strip() if ':' in caption else ''
+    
+    if session_id not in active_sessions:
+        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
+        return
+    
+    try:
+        # Get photo file
+        photo = update.message.photo[-1]  # Get highest resolution
+        file = await photo.get_file()
+        file_bytes = await file.download_as_bytearray()
+        
+        # Store file
+        file_id = str(uuid.uuid4())
+        file_storage[file_id] = {
+            'data': base64.b64encode(file_bytes).decode('utf-8'),
+            'mime_type': 'image/jpeg',
+            'filename': f'photo_{file_id}.jpg'
+        }
+        
+        # Store message
+        if session_id not in message_queue:
+            message_queue[session_id] = []
+        
+        message_queue[session_id].append({
+            'from': 'admin',
+            'message': message_text,
+            'type': 'image',
+            'file_id': file_id,
+            'filename': f'photo_{file_id}.jpg',
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        await update.message.reply_text(f"✅ Photo sent to {session_id}")
+    except Exception as e:
+        logger.error(f"Error handling admin photo: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin's document reply"""
+    caption = update.message.caption or ""
+    
+    if ':' not in caption and 'SES_' not in caption:
+        await update.message.reply_text(
+            "⚠️ Caption e session ID dao\n"
+            "Example: SES_12345"
+        )
+        return
+    
+    # Extract session ID
+    session_id = caption.split(':')[0].strip() if ':' in caption else caption.strip()
+    message_text = caption.split(':', 1)[1].strip() if ':' in caption else ''
+    
+    if session_id not in active_sessions:
+        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
+        return
+    
+    try:
+        # Get document file
+        document = update.message.document
+        file = await document.get_file()
+        file_bytes = await file.download_as_bytearray()
+        
+        # Store file
+        file_id = str(uuid.uuid4())
+        file_storage[file_id] = {
+            'data': base64.b64encode(file_bytes).decode('utf-8'),
+            'mime_type': document.mime_type,
+            'filename': document.file_name
+        }
+        
+        # Store message
+        if session_id not in message_queue:
+            message_queue[session_id] = []
+        
+        message_queue[session_id].append({
+            'from': 'admin',
+            'message': message_text,
+            'type': 'file',
+            'file_id': file_id,
+            'filename': document.file_name,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        await update.message.reply_text(f"✅ File sent to {session_id}")
+    except Exception as e:
+        logger.error(f"Error handling admin document: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle admin's voice/audio reply - NEW FUNCTION"""
+    caption = update.message.caption or ""
+    
+    # For voice messages, caption might be empty, check if replying to a message
+    if not caption or ('SES_' not in caption and ':' not in caption):
+        await update.message.reply_text(
+            "⚠️ Caption e session ID dao\n"
+            "Example: SES_12345: Voice reply"
+        )
+        return
+    
+    # Extract session ID
+    session_id = caption.split(':')[0].strip() if ':' in caption else caption.strip()
+    message_text = caption.split(':', 1)[1].strip() if ':' in caption else '🎤 Voice message'
+    
+    if session_id not in active_sessions:
+        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
+        return
+    
+    try:
+        # Get voice/audio file
+        voice_file = update.message.voice or update.message.audio
+        file = await voice_file.get_file()
+        file_bytes = await file.download_as_bytearray()
+        
+        # Determine filename and mime type
+        if update.message.voice:
+            filename = f'voice-message-{uuid.uuid4()}.ogg'
+            mime_type = 'audio/ogg'
+        else:
+            filename = update.message.audio.file_name or f'audio-{uuid.uuid4()}.mp3'
+            mime_type = update.message.audio.mime_type or 'audio/mpeg'
+        
+        # Store file
+        file_id = str(uuid.uuid4())
+        file_storage[file_id] = {
+            'data': base64.b64encode(file_bytes).decode('utf-8'),
+            'mime_type': mime_type,
+            'filename': filename
+        }
+        
+        # Store message
+        if session_id not in message_queue:
+            message_queue[session_id] = []
+        
+        message_queue[session_id].append({
+            'from': 'admin',
+            'message': message_text,
+            'type': 'voice',
+            'file_id': file_id,
+            'filename': filename,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        await update.message.reply_text(f"✅ Voice message sent to {session_id}")
+    except Exception as e:
+        logger.error(f"Error handling admin voice: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def send_telegram_notification(session_id: str, message: str, user_info: dict, file_info=None, file_type='file'):
+    """Send notification to admin via Telegram - FIXED VERSION"""
+    notification = (
+        f"💬 New Message from Website\n\n"
+        f"🆔 Session: {session_id}\n"
+        f"👤 User: {user_info.get('name', 'Anonymous')}\n"
+        f"📧 Email: {user_info.get('email', 'N/A')}\n"
+    )
+    
+    if file_info:
+        notification += f"📎 File: {file_info.get('filename', 'attachment')}\n"
+    
+    if message:
+        notification += f"💭 Message: {message}\n"
+    
+    notification += f"\n📝 Reply: {session_id}: Tumhar reply"
+    
+    try:
+        if file_info:
+            # Decode base64 file data
+            file_data = base64.b64decode(file_info['data'])
+            file_bytes = io.BytesIO(file_data)
+            file_bytes.name = file_info['filename']
+            
+            # Send based on file type
+            if file_type == 'image' or file_info['mime_type'].startswith('image/'):
+                await bot.send_photo(
+                    chat_id=ADMIN_CHAT_ID,
+                    photo=file_bytes,
+                    caption=notification
+                )
+            elif file_type == 'voice' or 'voice-message' in file_info['filename']:
+                await bot.send_voice(
+                    chat_id=ADMIN_CHAT_ID,
+                    voice=file_bytes,
+                    caption=notification
+                )
+            else:
+                await bot.send_document(
+                    chat_id=ADMIN_CHAT_ID,
+                    document=file_bytes,
+                    caption=notification
+                )
+        else:
+            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=notification)
+    except Exception as e:
+        logger.error(f"Failed to send Telegram notification: {e}")
+
+# Flask API Routes
+
 @app.route('/api/chat/init', methods=['POST'])
 def init_chat():
+    """Initialize a new chat session"""
     data = request.json
-    sid = f"SES_{datetime.now().strftime('%Y%m%d%H%M%S%f')[:17]}"
+    session_id = f"SES_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     
-    sessions[sid] = {
+    active_sessions[session_id] = {
         'name': data.get('name', 'Anonymous'),
         'email': data.get('email', ''),
-        'started': datetime.now().isoformat(),
-        'last_active': datetime.now().isoformat()
+        'started_at': datetime.now().isoformat()
     }
-    messages[sid] = []
     
-    # Run cleanup in background
-    import threading
-    threading.Thread(target=cleanup_old_sessions, daemon=True).start()
-    
-    logger.info(f"New session created: {sid} - User: {sessions[sid]['name']}")
-    logger.info(f"Active sessions: {len(sessions)}")
+    message_queue[session_id] = []
     
     return jsonify({
         'success': True,
-        'session_id': sid,
-        'message': 'Session created successfully'
+        'session_id': session_id
     })
 
 @app.route('/api/chat/send', methods=['POST'])
-def send_msg():
+def send_message():
+    """Send text message from visitor"""
     try:
         data = request.json
-        sid = data.get('session_id')
-        msg = data.get('message', '')
+        session_id = data.get('session_id')
+        message = data.get('message')
         
-        if not sid or sid not in sessions:
+        if not session_id or session_id not in active_sessions:
             return jsonify({'success': False, 'error': 'Invalid session'}), 400
         
-        messages[sid].append({
+        # Store visitor message
+        if session_id not in message_queue:
+            message_queue[session_id] = []
+        
+        message_queue[session_id].append({
             'from': 'visitor',
-            'message': msg,
+            'message': message,
             'type': 'text',
             'timestamp': datetime.now().isoformat()
         })
         
-        # Send to Telegram
-        user = sessions[sid]
-        text = (
-            f"💬 <b>নতুন মেসেজ</b>\n\n"
-            f"👤 <b>User:</b> {user['name']}\n"
-            f"📧 <b>Email:</b> {user.get('email', 'N/A')}\n"
-            f"💭 <b>Message:</b> {msg}\n\n"
-            f"📋 <b>Session ID:</b>\n"
-            f"<code>{sid}</code>\n\n"
-            f"📝 <i>Reply format:</i> <code>{sid}: Your message</code>"
-        )
+        # Send notification to admin - use thread-safe method
+        user_info = active_sessions[session_id]
+        loop = asyncio.new_event_loop()
         
-        # Send in background thread
-        from threading import Thread
-        Thread(target=send_message, args=(ADMIN_ID, text), daemon=True).start()
+        def send_notification():
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(send_telegram_notification(session_id, message, user_info))
         
-        logger.info(f"Message from {sid}")
+        import threading
+        thread = threading.Thread(target=send_notification)
+        thread.start()
+        
         return jsonify({'success': True})
     except Exception as e:
-        logger.error(f"Send error: {e}")
+        logger.error(f"Error in send_message: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/chat/upload', methods=['POST'])
-def upload():
+def upload_file():
+    """Upload file from visitor - FIXED VERSION"""
     try:
-        sid = request.form.get('session_id')
-        msg = request.form.get('message', '')
+        session_id = request.form.get('session_id')
+        message = request.form.get('message', '')
         
-        if not sid or sid not in sessions:
+        if not session_id or session_id not in active_sessions:
             return jsonify({'success': False, 'error': 'Invalid session'}), 400
         
         if 'file' not in request.files:
             return jsonify({'success': False, 'error': 'No file'}), 400
         
         file = request.files['file']
+        
+        # Read and store file
         file_bytes = file.read()
-        fid = str(uuid.uuid4())
+        file_id = str(uuid.uuid4())
         
         file_data = {
-            'data': base64.b64encode(file_bytes).decode(),
-            'mime': file.content_type or 'application/octet-stream',
-            'name': file.filename or 'file'
+            'data': base64.b64encode(file_bytes).decode('utf-8'),
+            'mime_type': file.content_type,
+            'filename': file.filename
         }
-        files[fid] = file_data
         
-        msg_type = 'image' if (file.content_type and file.content_type.startswith('image/')) else 'file'
+        file_storage[file_id] = file_data
         
-        messages[sid].append({
+        # Determine file type
+        is_voice = 'voice-message' in file.filename.lower()
+        is_image = file.content_type.startswith('image/')
+        
+        if is_voice:
+            msg_type = 'voice'
+            file_type_for_telegram = 'voice'
+        elif is_image:
+            msg_type = 'image'
+            file_type_for_telegram = 'image'
+        else:
+            msg_type = 'file'
+            file_type_for_telegram = 'file'
+        
+        # Store message
+        if session_id not in message_queue:
+            message_queue[session_id] = []
+        
+        message_queue[session_id].append({
             'from': 'visitor',
-            'message': msg,
+            'message': message,
             'type': msg_type,
-            'file_id': fid,
+            'file_id': file_id,
             'filename': file.filename,
             'timestamp': datetime.now().isoformat()
         })
         
-        # Notify admin
-        user = sessions[sid]
-        text = (
-            f"💬 <b>নতুন মেসেজ (File)</b>\n\n"
-            f"👤 <b>User:</b> {user['name']}\n"
-            f"📎 <b>File:</b> {file.filename}\n"
-            f"💭 <b>Message:</b> {msg}\n\n"
-            f"📋 <b>Session ID:</b>\n"
-            f"<code>{sid}</code>\n\n"
-            f"📝 <i>Reply format:</i> <code>{sid}: Your message</code>"
-        )
+        # Send notification to admin - use thread-safe method
+        user_info = active_sessions[session_id]
+        loop = asyncio.new_event_loop()
         
-        from threading import Thread
-        Thread(target=send_message, args=(ADMIN_ID, text), daemon=True).start()
+        def send_notification():
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(
+                send_telegram_notification(session_id, message, user_info, file_data, file_type_for_telegram)
+            )
         
-        logger.info(f"File from {sid}")
-        return jsonify({'success': True, 'file_id': fid})
+        import threading
+        thread = threading.Thread(target=send_notification)
+        thread.start()
+        
+        return jsonify({'success': True, 'file_id': file_id})
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"Error in upload_file: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/chat/file/<fid>', methods=['GET'])
-def get_file(fid):
-    if fid not in files:
-        return jsonify({'error': 'Not found'}), 404
+@app.route('/api/chat/file/<file_id>', methods=['GET'])
+def get_file(file_id):
+    """Get file by ID"""
+    if file_id not in file_storage:
+        return jsonify({'success': False, 'error': 'File not found'}), 404
     
-    file_data = files[fid]
+    file_data = file_storage[file_id]
     file_bytes = base64.b64decode(file_data['data'])
     
     return send_file(
         io.BytesIO(file_bytes),
-        mimetype=file_data['mime'],
+        mimetype=file_data['mime_type'],
         as_attachment=True,
-        download_name=file_data['name']
+        download_name=file_data['filename']
     )
 
-@app.route('/api/chat/poll/<sid>', methods=['GET'])
-def poll(sid):
-    # Update last active time
-    if sid in sessions:
-        sessions[sid]['last_active'] = datetime.now().isoformat()
-    else:
-        logger.warning(f"Poll attempt for non-existent session: {sid}")
-        logger.info(f"Current active sessions: {list(sessions.keys())}")
-        return jsonify({
-            'success': False,
-            'error': 'Session expired or invalid. Please refresh and start a new chat.',
-            'code': 'SESSION_NOT_FOUND'
-        }), 404
+@app.route('/api/chat/messages/<session_id>', methods=['GET'])
+def get_messages(session_id):
+    """Get all messages for a session"""
+    if session_id not in active_sessions:
+        return jsonify({'success': False, 'error': 'Invalid session'}), 400
     
-    last = int(request.args.get('last_count', 0))
-    msgs = messages.get(sid, [])
-    
-    new_msgs = msgs[last:]
-    
-    if new_msgs:
-        logger.info(f"Returning {len(new_msgs)} new messages for {sid}")
+    messages = message_queue.get(session_id, [])
     
     return jsonify({
         'success': True,
-        'messages': new_msgs,
-        'total_count': len(msgs),
-        'session_active': True
+        'messages': messages
     })
 
-@app.route('/api/chat/reply', methods=['POST'])
-def manual_reply():
-    """Manual reply endpoint for admin"""
-    try:
-        data = request.json
-        sid = data.get('session_id')
-        reply = data.get('message')
-        
-        if not sid or sid not in sessions:
-            return jsonify({'success': False, 'error': 'Invalid session'}), 400
-        
-        messages[sid].append({
-            'from': 'admin',
-            'message': reply,
-            'type': 'text',
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/chat/webhook', methods=['POST'])
-def webhook():
-    """Telegram webhook for receiving admin replies"""
-    try:
-        data = request.json
-        logger.info(f"Webhook: {json.dumps(data)[:200]}")
-        
-        if 'message' not in data:
-            return jsonify({'ok': True})
-        
-        message = data['message']
-        chat_id = str(message['chat']['id'])
-        
-        # Only admin
-        if chat_id != ADMIN_ID:
-            return jsonify({'ok': True})
-        
-        # Handle commands
-        if 'text' in message:
-            text = message['text']
-            
-            if text == '/start':
-                send_message(ADMIN_ID, 
-                    "✅ <b>Bot Active!</b>\n\n"
-                    "🎯 <b>How to reply:</b>\n"
-                    "• Text: <code>SES_xxxxx: Message</code>\n"
-                    "• Photo: Send + caption <code>SES_xxxxx</code>\n"
-                    "• File: Send + caption <code>SES_xxxxx</code>\n\n"
-                    "📋 <b>Commands:</b>\n"
-                    "/sessions - Active chats\n"
-                    "/session &lt;id&gt; - Session details\n"
-                    "/close &lt;id&gt; - Close session\n"
-                    "/broadcast - Message all\n"
-                    "/help - Full guide\n"
-                    "/ping - Test bot\n\n"
-                    "💡 <i>Tip: Tap session ID to copy</i>"
-                )
-                return jsonify({'ok': True})
-            
-            if text == '/help':
-                help_text = (
-                    "📖 <b>Complete Help Guide</b>\n\n"
-                    "<b>🔹 Basic Commands:</b>\n"
-                    "/start - Activate bot\n"
-                    "/sessions - List active chats\n"
-                    "/help - This guide\n"
-                    "/ping - Test response\n\n"
-                    "<b>🔹 Advanced Commands:</b>\n"
-                    "/session &lt;id&gt; - View session details\n"
-                    "/close &lt;id&gt; - Close session\n"
-                    "/broadcast &lt;msg&gt; - Send to all\n\n"
-                    "<b>🔹 Reply Format:</b>\n"
-                    "<code>SES_xxxxx: Your message</code>\n\n"
-                    "<b>Example:</b>\n"
-                    "<code>SES_20251030224346203: Hello! How can I help?</code>\n\n"
-                    "<b>🔹 Photo Reply:</b>\n"
-                    "1. Send photo\n"
-                    "2. Caption: <code>SES_xxxxx</code>\n\n"
-                    "<b>🔹 File Reply:</b>\n"
-                    "1. Send document\n"
-                    "2. Caption: <code>SES_xxxxx</code>\n\n"
-                    "<b>💡 Tips:</b>\n"
-                    "• Tap session ID to copy\n"
-                    "• Use /session to check details\n"
-                    "• Use /close to end chat\n"
-                    "• Use /broadcast for announcements"
-                )
-                send_message(ADMIN_ID, help_text)
-                return jsonify({'ok': True})
-            
-            if text == '/ping':
-                import time
-                start_time = time.time()
-                send_message(ADMIN_ID, "🏓 Pong!")
-                response_time = int((time.time() - start_time) * 1000)
-                send_message(ADMIN_ID, f"⚡ Response time: <code>{response_time}ms</code>\n\n🟢 Bot is working perfectly!")
-                return jsonify({'ok': True})
-            
-            if text == '/sessions':
-                if not sessions:
-                    send_message(ADMIN_ID, "📭 <b>No active sessions</b>")
-                else:
-                    msg = "📊 <b>Active Sessions:</b>\n\n"
-                    for s, d in list(sessions.items())[:10]:
-                        msg += f"🔹 <code>{s}</code>\n"
-                        msg += f"   👤 {d['name']}\n\n"
-                    if len(sessions) > 10:
-                        msg += f"\n<i>... and {len(sessions) - 10} more</i>"
-                    send_message(ADMIN_ID, msg)
-                return jsonify({'ok': True})
-            
-            # /session command - View specific session details
-            if text.startswith('/session '):
-                sid = text.replace('/session ', '').strip()
-                
-                if sid not in sessions:
-                    send_message(ADMIN_ID, f"❌ <b>Session not found:</b>\n<code>{sid}</code>")
-                else:
-                    session_data = sessions[sid]
-                    session_messages = messages.get(sid, [])
-                    
-                    started_time = datetime.fromisoformat(session_data['started'])
-                    time_diff = datetime.now() - started_time
-                    hours = int(time_diff.total_seconds() // 3600)
-                    minutes = int((time_diff.total_seconds() % 3600) // 60)
-                    
-                    msg = (
-                        f"📋 <b>Session Details</b>\n\n"
-                        f"🆔 <code>{sid}</code>\n"
-                        f"👤 <b>User:</b> {session_data['name']}\n"
-                        f"📧 <b>Email:</b> {session_data.get('email', 'N/A')}\n"
-                        f"⏰ <b>Started:</b> {started_time.strftime('%I:%M %p')}\n"
-                        f"⏱️ <b>Duration:</b> {hours}h {minutes}m\n"
-                        f"💬 <b>Messages:</b> {len(session_messages)}\n"
-                        f"📌 <b>Status:</b> Active\n\n"
-                        f"<i>Reply format:</i> <code>{sid}: Your message</code>"
-                    )
-                    send_message(ADMIN_ID, msg)
-                return jsonify({'ok': True})
-            
-            # /close command - Close a specific session
-            if text.startswith('/close '):
-                sid = text.replace('/close ', '').strip()
-                
-                if sid not in sessions:
-                    send_message(ADMIN_ID, f"❌ <b>Session not found:</b>\n<code>{sid}</code>")
-                else:
-                    user_name = sessions[sid]['name']
-                    
-                    # Send closing message to visitor
-                    if sid in messages:
-                        messages[sid].append({
-                            'from': 'admin',
-                            'message': '⚠️ এই চ্যাট সেশন বন্ধ করা হয়েছে। নতুন চ্যাট শুরু করতে পেজ রিফ্রেশ করুন।',
-                            'type': 'text',
-                            'timestamp': datetime.now().isoformat()
-                        })
-                    
-                    # Remove session
-                    del sessions[sid]
-                    logger.info(f"Session {sid} closed by admin")
-                    
-                    send_message(ADMIN_ID, 
-                        f"✅ <b>Session Closed</b>\n\n"
-                        f"🆔 <code>{sid}</code>\n"
-                        f"👤 User: {user_name}\n"
-                        f"📢 User will be notified"
-                    )
-                return jsonify({'ok': True})
-            
-            # /broadcast command - Send message to all active sessions
-            if text.startswith('/broadcast '):
-                broadcast_msg = text.replace('/broadcast ', '').strip()
-                
-                if not broadcast_msg:
-                    send_message(ADMIN_ID, "⚠️ <b>Usage:</b> <code>/broadcast Your message</code>")
-                    return jsonify({'ok': True})
-                
-                if not sessions:
-                    send_message(ADMIN_ID, "📭 <b>No active sessions</b>")
-                    return jsonify({'ok': True})
-                
-                # Send to all sessions
-                sent_count = 0
-                for sid in list(sessions.keys()):
-                    if sid in messages:
-                        messages[sid].append({
-                            'from': 'admin',
-                            'message': f"📢 <b>Announcement:</b> {broadcast_msg}",
-                            'type': 'text',
-                            'timestamp': datetime.now().isoformat()
-                        })
-                        sent_count += 1
-                
-                send_message(ADMIN_ID,
-                    f"📢 <b>Broadcast Sent!</b>\n\n"
-                    f"✅ Delivered to {sent_count} active session(s)\n"
-                    f"💬 Message: {broadcast_msg}"
-                )
-                return jsonify({'ok': True})
-            
-            # Reply to visitor
-            if ':' in text and 'SES_' in text:
-                parts = text.split(':', 1)
-                sid = parts[0].strip()
-                reply = parts[1].strip() if len(parts) > 1 else ''
-                
-                logger.info(f"Processing reply - Session: {sid}, Reply: {reply}")
-                
-                if sid in sessions:
-                    messages[sid].append({
-                        'from': 'admin',
-                        'message': reply,
-                        'type': 'text',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    logger.info(f"Message added to session {sid}. Total messages: {len(messages[sid])}")
-                    send_message(ADMIN_ID, f"✅ <b>Reply sent to:</b>\n<code>{sid}</code>")
-                else:
-                    logger.warning(f"Session {sid} not found in {list(sessions.keys())}")
-                    send_message(ADMIN_ID, f"❌ <b>Session not found:</b>\n<code>{sid}</code>")
-        
-        return jsonify({'ok': True})
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({'ok': True})
+@app.route('/api/chat/poll/<session_id>', methods=['GET'])
+def poll_messages(session_id):
+    """Poll for new messages"""
+    if session_id not in active_sessions:
+        return jsonify({'success': False, 'error': 'Invalid session'}), 400
+    
+    last_message_count = int(request.args.get('last_count', 0))
+    messages = message_queue.get(session_id, [])
+    
+    # Return only new messages
+    new_messages = messages[last_message_count:]
+    
+    return jsonify({
+        'success': True,
+        'messages': new_messages,
+        'total_count': len(messages)
+    })
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({
-        'status': 'healthy',
-        'active_sessions': len(sessions),
-        'total_messages': sum(len(m) for m in messages.values()),
-        'uptime': 'running',
-        'session_ids': list(sessions.keys()) if len(sessions) < 10 else f"{len(sessions)} active"
-    })
-
-@app.route('/test-bot', methods=['GET'])
-def test_bot():
-    """Test if bot token is working"""
-    try:
-        url = f'{TELEGRAM_API}/getMe'
-        with urlopen(url, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return jsonify({
-                'success': result.get('ok', False),
-                'bot_info': result.get('result', {}),
-                'message': 'Bot is working!' if result.get('ok') else 'Bot token invalid'
-            })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/setup-webhook', methods=['GET'])
-def setup_webhook():
-    """Setup Telegram webhook"""
-    try:
-        # Force HTTPS for webhook URL (Render always uses HTTPS)
-        host = request.host
-        webhook_url = f'https://{host}/api/chat/webhook'
-        
-        logger.info(f"Setting webhook to: {webhook_url}")
-        
-        # Delete existing webhook first
-        delete_url = f'{TELEGRAM_API}/deleteWebhook'
-        try:
-            with urlopen(delete_url, timeout=10) as response:
-                delete_result = json.loads(response.read().decode('utf-8'))
-                logger.info(f"Delete webhook: {delete_result}")
-        except Exception as e:
-            logger.warning(f"Delete webhook failed: {e}")
-        
-        # Set new webhook
-        from urllib.parse import urlencode
-        params = urlencode({'url': webhook_url})
-        set_url = f'{TELEGRAM_API}/setWebhook?{params}'
-        
-        logger.info(f"Making request to: {set_url}")
-        
-        with urlopen(set_url, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            logger.info(f"Set webhook result: {result}")
-            
-            return jsonify({
-                'success': result.get('ok', False),
-                'webhook_url': webhook_url,
-                'description': result.get('description', ''),
-                'error': result.get('description') if not result.get('ok') else None,
-                'result': result
-            })
-    except Exception as e:
-        logger.error(f"Webhook setup error: {e}", exc_info=True)
-        host = request.host
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'webhook_url': f'https://{host}/api/chat/webhook'
-        }), 500
-
-@app.route('/debug/session/<sid>', methods=['GET'])
-def debug_session(sid):
-    """Debug endpoint to check session data"""
-    return jsonify({
-        'session_exists': sid in sessions,
-        'session_data': sessions.get(sid, {}),
-        'message_count': len(messages.get(sid, [])),
-        'messages': messages.get(sid, []),
-        'all_active_sessions': list(sessions.keys()),
-        'server_time': datetime.now().isoformat(),
-        'help': 'If session_exists is false, create a new chat session'
-    })
-
-@app.route('/webhook-info', methods=['GET'])
-def webhook_info():
-    """Get current webhook info"""
-    try:
-        url = f'{TELEGRAM_API}/getWebhookInfo'
-        with urlopen(url, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/')
-def index():
-    return jsonify({
-        'service': 'Live Chat API',
-        'status': 'running',
-        'endpoints': {
-            'health': '/health',
-            'test_bot': '/test-bot - Test if bot token works',
-            'webhook_info': '/webhook-info - Check current webhook',
-            'setup_webhook': '/setup-webhook - Setup webhook for replies',
-            'init_chat': 'POST /api/chat/init',
-            'send_message': 'POST /api/chat/send',
-            'poll_messages': 'GET /api/chat/poll/<session_id>'
-        },
-        'setup_steps': [
-            '1. Visit /test-bot to verify bot token',
-            '2. Visit /setup-webhook to enable replies',
-            '3. Check /webhook-info to verify setup',
-            '4. Send /start to bot in Telegram'
-        ]
-    })
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'bot_active': bot is not None})
 
 if __name__ == '__main__':
+    # Start Telegram bot in background
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(init_telegram_bot())
+    
+    import threading
+    def run_async_loop():
+        loop.run_forever()
+    
+    thread = threading.Thread(target=run_async_loop, daemon=True)
+    thread.start()
+    
+    # Start Flask app
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"Starting on port {port}")
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    app.run(host='0.0.0.0', port=port)

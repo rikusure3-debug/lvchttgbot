@@ -1,521 +1,423 @@
 import os
-import asyncio
-import uuid
-from datetime import datetime
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-from telegram import Update, Bot, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import logging
-import base64
-import io
+import time
+import threading
+import json
+import re
+import requests
+from flask import Flask, request
+import telebot
+from telebot import types
+from github import Github, BadCredentialsException
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ======================
+# CONFIG
+# ======================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") 
 
-app = Flask(__name__)
-CORS(app)
+if not BOT_TOKEN:
+    raise SystemExit("❗ BOT_TOKEN environment variable not found!")
 
-# Configuration
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8295821417:AAEZytkScbqqajoK4kw2UyFHt96bKXYOa-A')
-ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID', '2098068100')
+# ======================
+# Setup bot
+# ======================
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='Markdown')
+sessions = {}
 
-# In-memory storage (use Redis/Database for production)
-active_sessions = {}  # {session_id: {user_data}}
-message_queue = {}  # {session_id: [messages]}
-file_storage = {}  # {file_id: file_data}
+# =================================================
+# UTILITY FUNCTIONS (All 3 bots combined)
+# =================================================
+def get_session(chat_id):
+    """Return or create a user session."""
+    if chat_id not in sessions:
+        sessions[chat_id] = {"step": None}
+    return sessions[chat_id]
 
-# Initialize Telegram Bot
-telegram_app = None
-bot = None
-
-async def init_telegram_bot():
-    """Initialize Telegram bot"""
-    global telegram_app, bot
-    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    bot = telegram_app.bot
-    
-    # Add handlers
-    telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("sessions", list_sessions))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_reply))
-    telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_admin_photo))
-    telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_admin_document))
-    telegram_app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_admin_voice))  # ✅ Voice handler added
-    
-    # Start bot
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling()
-    logger.info("✅ Telegram bot started successfully")
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    await update.message.reply_text(
-        "✅ Live Chat Bot Active!\n\n"
-        "🔹 Visitor message korle notification ashbe\n"
-        "🔹 Text reply: SES_xxxxx: Tumhar message\n"
-        "🔹 Photo/File/Voice reply: Media pathao + caption e SES_xxxxx likho\n"
-        "🔹 Active sessions: /sessions"
-    )
-
-async def list_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all active sessions"""
-    if not active_sessions:
-        await update.message.reply_text("🔭 Kono active session nei")
-        return
-    
-    message = "📊 Active Sessions:\n\n"
-    for session_id, data in active_sessions.items():
-        message += f"🔹 {session_id}\n"
-        message += f"   Name: {data.get('name', 'Unknown')}\n"
-        message += f"   Started: {data.get('started_at', 'Unknown')}\n"
-        message += f"   Messages: {len(message_queue.get(session_id, []))}\n\n"
-    
-    await update.message.reply_text(message)
-
-async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin's text reply to customer"""
-    text = update.message.text
-    
-    # Check if message contains session ID
-    if ':' not in text:
-        await update.message.reply_text(
-            "⚠️ Format: SES_xxxxx: Tumhar message\n"
-            "Example: SES_12345: Hello, how can I help?"
-        )
-        return
-    
-    session_id, reply_message = text.split(':', 1)
-    session_id = session_id.strip()
-    reply_message = reply_message.strip()
-    
-    if session_id not in active_sessions:
-        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
-        return
-    
-    # Store admin reply
-    if session_id not in message_queue:
-        message_queue[session_id] = []
-    
-    message_queue[session_id].append({
-        'from': 'admin',
-        'message': reply_message,
-        'type': 'text',
-        'timestamp': datetime.now().isoformat()
-    })
-    
-    await update.message.reply_text(f"✅ Reply sent to {session_id}")
-
-async def handle_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin's photo reply - FIXED VERSION"""
-    caption = update.message.caption or ""
-    
-    if ':' not in caption and 'SES_' not in caption:
-        await update.message.reply_text(
-            "⚠️ Caption e session ID dao\n"
-            "Example: SES_12345: Check this image"
-        )
-        return
-    
-    # Extract session ID
-    session_id = caption.split(':')[0].strip() if ':' in caption else caption.strip()
-    message_text = caption.split(':', 1)[1].strip() if ':' in caption else ''
-    
-    if session_id not in active_sessions:
-        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
-        return
-    
+# --- GitHub Editor Utilities ---
+def list_repo_files(repo, path=""):
+    result = []
     try:
-        # Get photo file
-        photo = update.message.photo[-1]  # Get highest resolution
-        file = await photo.get_file()
-        file_bytes = await file.download_as_bytearray()
-        
-        # Store file
-        file_id = str(uuid.uuid4())
-        file_storage[file_id] = {
-            'data': base64.b64encode(file_bytes).decode('utf-8'),
-            'mime_type': 'image/jpeg',
-            'filename': f'photo_{file_id}.jpg'
-        }
-        
-        # Store message
-        if session_id not in message_queue:
-            message_queue[session_id] = []
-        
-        message_queue[session_id].append({
-            'from': 'admin',
-            'message': message_text,
-            'type': 'image',
-            'file_id': file_id,
-            'filename': f'photo_{file_id}.jpg',
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        await update.message.reply_text(f"✅ Photo sent to {session_id}")
-    except Exception as e:
-        logger.error(f"Error handling admin photo: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def handle_admin_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin's document reply"""
-    caption = update.message.caption or ""
-    
-    if ':' not in caption and 'SES_' not in caption:
-        await update.message.reply_text(
-            "⚠️ Caption e session ID dao\n"
-            "Example: SES_12345"
-        )
-        return
-    
-    # Extract session ID
-    session_id = caption.split(':')[0].strip() if ':' in caption else caption.strip()
-    message_text = caption.split(':', 1)[1].strip() if ':' in caption else ''
-    
-    if session_id not in active_sessions:
-        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
-        return
-    
-    try:
-        # Get document file
-        document = update.message.document
-        file = await document.get_file()
-        file_bytes = await file.download_as_bytearray()
-        
-        # Store file
-        file_id = str(uuid.uuid4())
-        file_storage[file_id] = {
-            'data': base64.b64encode(file_bytes).decode('utf-8'),
-            'mime_type': document.mime_type,
-            'filename': document.file_name
-        }
-        
-        # Store message
-        if session_id not in message_queue:
-            message_queue[session_id] = []
-        
-        message_queue[session_id].append({
-            'from': 'admin',
-            'message': message_text,
-            'type': 'file',
-            'file_id': file_id,
-            'filename': document.file_name,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        await update.message.reply_text(f"✅ File sent to {session_id}")
-    except Exception as e:
-        logger.error(f"Error handling admin document: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin's voice/audio reply - NEW FUNCTION"""
-    caption = update.message.caption or ""
-    
-    # For voice messages, caption might be empty, check if replying to a message
-    if not caption or ('SES_' not in caption and ':' not in caption):
-        await update.message.reply_text(
-            "⚠️ Caption e session ID dao\n"
-            "Example: SES_12345: Voice reply"
-        )
-        return
-    
-    # Extract session ID
-    session_id = caption.split(':')[0].strip() if ':' in caption else caption.strip()
-    message_text = caption.split(':', 1)[1].strip() if ':' in caption else '🎤 Voice message'
-    
-    if session_id not in active_sessions:
-        await update.message.reply_text(f"❌ Session {session_id} khuje paoa jaini")
-        return
-    
-    try:
-        # Get voice/audio file
-        voice_file = update.message.voice or update.message.audio
-        file = await voice_file.get_file()
-        file_bytes = await file.download_as_bytearray()
-        
-        # Determine filename and mime type
-        if update.message.voice:
-            filename = f'voice-message-{uuid.uuid4()}.ogg'
-            mime_type = 'audio/ogg'
-        else:
-            filename = update.message.audio.file_name or f'audio-{uuid.uuid4()}.mp3'
-            mime_type = update.message.audio.mime_type or 'audio/mpeg'
-        
-        # Store file
-        file_id = str(uuid.uuid4())
-        file_storage[file_id] = {
-            'data': base64.b64encode(file_bytes).decode('utf-8'),
-            'mime_type': mime_type,
-            'filename': filename
-        }
-        
-        # Store message
-        if session_id not in message_queue:
-            message_queue[session_id] = []
-        
-        message_queue[session_id].append({
-            'from': 'admin',
-            'message': message_text,
-            'type': 'voice',
-            'file_id': file_id,
-            'filename': filename,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        await update.message.reply_text(f"✅ Voice message sent to {session_id}")
-    except Exception as e:
-        logger.error(f"Error handling admin voice: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def send_telegram_notification(session_id: str, message: str, user_info: dict, file_info=None, file_type='file'):
-    """Send notification to admin via Telegram - FIXED VERSION"""
-    notification = (
-        f"💬 New Message from Website\n\n"
-        f"🆔 Session: {session_id}\n"
-        f"👤 User: {user_info.get('name', 'Anonymous')}\n"
-        f"📧 Email: {user_info.get('email', 'N/A')}\n"
-    )
-    
-    if file_info:
-        notification += f"📎 File: {file_info.get('filename', 'attachment')}\n"
-    
-    if message:
-        notification += f"💭 Message: {message}\n"
-    
-    notification += f"\n📝 Reply: {session_id}: Tumhar reply"
-    
-    try:
-        if file_info:
-            # Decode base64 file data
-            file_data = base64.b64decode(file_info['data'])
-            file_bytes = io.BytesIO(file_data)
-            file_bytes.name = file_info['filename']
-            
-            # Send based on file type
-            if file_type == 'image' or file_info['mime_type'].startswith('image/'):
-                await bot.send_photo(
-                    chat_id=ADMIN_CHAT_ID,
-                    photo=file_bytes,
-                    caption=notification
-                )
-            elif file_type == 'voice' or 'voice-message' in file_info['filename']:
-                await bot.send_voice(
-                    chat_id=ADMIN_CHAT_ID,
-                    voice=file_bytes,
-                    caption=notification
-                )
+        contents = repo.get_contents(path)
+        for item in contents:
+            if item.type == "dir":
+                result.extend(list_repo_files(repo, item.path))
             else:
-                await bot.send_document(
-                    chat_id=ADMIN_CHAT_ID,
-                    document=file_bytes,
-                    caption=notification
-                )
-        else:
-            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=notification)
-    except Exception as e:
-        logger.error(f"Failed to send Telegram notification: {e}")
+                result.append(item.path)
+    except Exception: pass
+    return result
 
-# Flask API Routes
+def send_numbered_list(chat_id, items, title="Items", per_page=50):
+    if not items:
+        bot.send_message(chat_id, f"⚠️ No {title.lower()} found."); return
+    text = f"*{title}* — total: {len(items)}\n\n"
+    for i, item in enumerate(items[:per_page], 1):
+        text += f"{i}. `{item}`\n"
+    if len(items) > per_page:
+        text += f"\n_Showing first {per_page}._"
+    bot.send_message(chat_id, text)
 
-@app.route('/api/chat/init', methods=['POST'])
-def init_chat():
-    """Initialize a new chat session"""
-    data = request.json
-    session_id = f"SES_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    
-    active_sessions[session_id] = {
-        'name': data.get('name', 'Anonymous'),
-        'email': data.get('email', ''),
-        'started_at': datetime.now().isoformat()
-    }
-    
-    message_queue[session_id] = []
-    
-    return jsonify({
-        'success': True,
-        'session_id': session_id
-    })
-
-@app.route('/api/chat/send', methods=['POST'])
-def send_message():
-    """Send text message from visitor"""
+# --- JWT Token Generator Utilities ---
+def fetch_jwt_token(account):
+    uid, password = account.get("uid"), account.get("password")
+    if not uid or not password: return None
+    url = f"https://jwt-yunus-new.vercel.app/token?uid={uid}&password={password}"
     try:
-        data = request.json
-        session_id = data.get('session_id')
-        message = data.get('message')
-        
-        if not session_id or session_id not in active_sessions:
-            return jsonify({'success': False, 'error': 'Invalid session'}), 400
-        
-        # Store visitor message
-        if session_id not in message_queue:
-            message_queue[session_id] = []
-        
-        message_queue[session_id].append({
-            'from': 'visitor',
-            'message': message,
-            'type': 'text',
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        # Send notification to admin - use thread-safe method
-        user_info = active_sessions[session_id]
-        loop = asyncio.new_event_loop()
-        
-        def send_notification():
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(send_telegram_notification(session_id, message, user_info))
-        
-        import threading
-        thread = threading.Thread(target=send_notification)
-        thread.start()
-        
-        return jsonify({'success': True})
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200 and (token := response.json().get("token")):
+            return {"token": token}
     except Exception as e:
-        logger.error(f"Error in send_message: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        print(f"Request failed for UID {uid}: {e}")
+    return None
 
-@app.route('/api/chat/upload', methods=['POST'])
-def upload_file():
-    """Upload file from visitor - FIXED VERSION"""
+# --- JSON Converter Utilities (NEW!) ---
+_uid_re = re.compile(r'"?\buid\b"?\s*:\s*(?P<val>"[^"]*"|[0-9]+)', re.I)
+_password_re = re.compile(r'"?\bpass(?:word)?\b"?\s*:\s*(?P<val>"[^"]*"|[^,\}\n]+)', re.I)
+
+def try_parse_json(text: str):
+    text = re.sub(r',\s*(?=[}\]])', '', text.strip())
+    wrapped = f'[{text}]' if text.startswith('{') and not text.startswith('[') else text
+    parsed = json.loads(wrapped)
+    if isinstance(parsed, dict): return [parsed]
+    if isinstance(parsed, list): return [item for item in parsed if isinstance(item, dict)]
+    raise ValueError("Parsed data is not a list or dict")
+
+def parse_by_blocks(text: str):
+    s = re.sub(r',\s*(?=})', '', text.replace('\r\n', '\n').strip())
+    parts = re.split(r'\}\s*,\s*\{', s)
+    results, seen = [], set()
+    for p in parts:
+        block = '{' + p.strip() if not p.strip().startswith('{') else p.strip()
+        block = block + '}' if not block.endswith('}') else block
+        uid_m = _uid_re.search(block)
+        pass_m = _password_re.search(block)
+        if uid_m and pass_m:
+            uid = uid_m.group('val').strip().strip('"')
+            pwd = pass_m.group('val').strip().strip('"')
+            if (uid, pwd) not in seen:
+                results.append({"uid": uid, "password": pwd})
+                seen.add((uid, pwd))
+    return results
+
+def extract_uid_password_pairs(text: str):
     try:
-        session_id = request.form.get('session_id')
-        message = request.form.get('message', '')
-        
-        if not session_id or session_id not in active_sessions:
-            return jsonify({'success': False, 'error': 'Invalid session'}), 400
-        
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'No file'}), 400
-        
-        file = request.files['file']
-        
-        # Read and store file
-        file_bytes = file.read()
-        file_id = str(uuid.uuid4())
-        
-        file_data = {
-            'data': base64.b64encode(file_bytes).decode('utf-8'),
-            'mime_type': file.content_type,
-            'filename': file.filename
-        }
-        
-        file_storage[file_id] = file_data
-        
-        # Determine file type
-        is_voice = 'voice-message' in file.filename.lower()
-        is_image = file.content_type.startswith('image/')
-        
-        if is_voice:
-            msg_type = 'voice'
-            file_type_for_telegram = 'voice'
-        elif is_image:
-            msg_type = 'image'
-            file_type_for_telegram = 'image'
-        else:
-            msg_type = 'file'
-            file_type_for_telegram = 'file'
-        
-        # Store message
-        if session_id not in message_queue:
-            message_queue[session_id] = []
-        
-        message_queue[session_id].append({
-            'from': 'visitor',
-            'message': message,
-            'type': msg_type,
-            'file_id': file_id,
-            'filename': file.filename,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        # Send notification to admin - use thread-safe method
-        user_info = active_sessions[session_id]
-        loop = asyncio.new_event_loop()
-        
-        def send_notification():
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(
-                send_telegram_notification(session_id, message, user_info, file_data, file_type_for_telegram)
-            )
-        
-        import threading
-        thread = threading.Thread(target=send_notification)
-        thread.start()
-        
-        return jsonify({'success': True, 'file_id': file_id})
-    except Exception as e:
-        logger.error(f"Error in upload_file: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        objs = try_parse_json(text)
+        res, seen = [], set()
+        for o in objs:
+            uid_val, pass_val = None, None
+            for k, v in o.items():
+                kl = k.lower()
+                if kl in ("uid", "user", "user_id", "id"): uid_val = str(v)
+                if kl in ("password", "pass", "pwd"): pass_val = str(v)
+            if uid_val and pass_val and (uid_val, pass_val) not in seen:
+                res.append({"uid": uid_val, "password": pass_val})
+                seen.add((uid_val, pass_val))
+        if res: return res
+    except Exception: pass
+    
+    res = parse_by_blocks(text)
+    if res: return res
+    
+    return []
 
-@app.route('/api/chat/file/<file_id>', methods=['GET'])
-def get_file(file_id):
-    """Get file by ID"""
-    if file_id not in file_storage:
-        return jsonify({'success': False, 'error': 'File not found'}), 404
+# =================================================
+# KEYBOARD & COMMANDS
+# =================================================
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    btn_github = types.InlineKeyboardButton("🐙 GitHub Editor", callback_data="github_start")
+    btn_jwt = types.InlineKeyboardButton("🔑 JWT Generator", callback_data="jwt_generator_start")
+    btn_json = types.InlineKeyboardButton("⚙️ JSON Converter", callback_data="json_converter_start")
+    markup.add(btn_github, btn_jwt, btn_json)
     
-    file_data = file_storage[file_id]
-    file_bytes = base64.b64decode(file_data['data'])
-    
-    return send_file(
-        io.BytesIO(file_bytes),
-        mimetype=file_data['mime_type'],
-        as_attachment=True,
-        download_name=file_data['filename']
+    bot.send_message(
+        message.chat.id,
+        "👋 *Welcome to your 3-in-1 Super-Bot!*\n\n"
+        "Please choose a task from the menu:",
+        reply_markup=markup
     )
 
-@app.route('/api/chat/messages/<session_id>', methods=['GET'])
-def get_messages(session_id):
-    """Get all messages for a session"""
-    if session_id not in active_sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'}), 400
-    
-    messages = message_queue.get(session_id, [])
-    
-    return jsonify({
-        'success': True,
-        'messages': messages
-    })
+@bot.message_handler(commands=['cancel'])
+def cmd_cancel(message):
+    sessions.pop(message.chat.id, None)
+    bot.send_message(message.chat.id, "✅ Operation cancelled. Press /start to see the menu.")
 
-@app.route('/api/chat/poll/<session_id>', methods=['GET'])
-def poll_messages(session_id):
-    """Poll for new messages"""
-    if session_id not in active_sessions:
-        return jsonify({'success': False, 'error': 'Invalid session'}), 400
-    
-    last_message_count = int(request.args.get('last_count', 0))
-    messages = message_queue.get(session_id, [])
-    
-    # Return only new messages
-    new_messages = messages[last_message_count:]
-    
-    return jsonify({
-        'success': True,
-        'messages': new_messages,
-        'total_count': len(messages)
-    })
+# =================================================
+# CALLBACK HANDLER (Handles button clicks)
+# =================================================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback_query(call):
+    chat_id = call.message.chat.id
+    sess = get_session(chat_id)
+    bot.answer_callback_query(call.id)
 
-@app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'bot_active': bot is not None})
+    if call.data == "github_start":
+        bot.edit_message_text("Selected: *🐙 GitHub Editor*", chat_id, call.message.message_id)
+        if not sess.get("github_client"):
+            sess["step"] = "ask_github_token"
+            bot.send_message(chat_id, "Please send your *GitHub Personal Access Token* to continue.")
+        else:
+            list_github_repos(call.message)
 
-if __name__ == '__main__':
-    # Start Telegram bot in background
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(init_telegram_bot())
+    elif call.data == "jwt_generator_start":
+        bot.edit_message_text("Selected: *🔑 JWT Generator*", chat_id, call.message.message_id)
+        sess['step'] = 'awaiting_jwt_json'
+        bot.send_message(chat_id, "Please upload the JSON file with accounts (`uid` and `password`).")
+
+    elif call.data == "json_converter_start":
+        bot.edit_message_text("Selected: *⚙️ JSON Converter*", chat_id, call.message.message_id)
+        sess['step'] = 'awaiting_json_text_or_file'
+        bot.send_message(
+            chat_id, 
+            "📋 *JSON Converter*\n\n"
+            "Send me account details in any of these formats:\n"
+            "• 📝 Text message (copy-paste accounts)\n"
+            "• 📄 Text/JSON file\n\n"
+            "❌ *Not supported:* Voice messages, Images\n\n"
+            "I will extract `uid` and `password` pairs into a clean JSON file."
+        )
+
+# =================================================
+# GITHUB WORKFLOW LOGIC
+# =================================================
+def list_github_repos(message):
+    # This function remains unchanged
+    chat_id = message.chat.id
+    sess = get_session(chat_id)
+    bot.send_message(chat_id, "⏳ Fetching your GitHub repositories...")
+    try:
+        repos = list(sess["github_client"].get_user().get_repos())
+        if not repos: bot.send_message(chat_id, "⚠️ No repositories found."); return
+        sess.update({'repos': [(r.full_name, r) for r in repos], 'step': 'select_repo'})
+        send_numbered_list(chat_id, [r.full_name for r in repos], title="Your Repositories")
+        bot.send_message(chat_id, "➡️ Send the *number* or *full name* of the repo to open.")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Error fetching repos:\n`{e}`")
+
+# =================================================
+# MESSAGE HANDLERS
+# =================================================
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+    sess = get_session(chat_id)
+
+    # --- GitHub Editor Workflow ---
+    if sess.get("step") == "ask_github_token":
+        try:
+            github_client = Github(text)
+            github_client.get_user().login
+            sess.update({"github_token": text, "github_client": github_client, "step": None})
+            bot.send_message(chat_id, "✅ GitHub token saved! Now listing repositories...")
+            list_github_repos(message)
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Invalid GitHub token or error: `{e}`.")
+        return
+
+    if sess.get('step') == 'select_repo':
+        repo = next((r for name, r in sess['repos'] if name.lower() == text.lower()), None)
+        if not repo:
+            try: repo = sess['repos'][int(text) - 1][1]
+            except (ValueError, IndexError): bot.send_message(chat_id, "⚠️ Invalid repo."); return
+        sess.update({'repo': repo, 'step': 'select_file'})
+        bot.send_message(chat_id, f"✅ Selected: *{repo.full_name}*\n⏳ Listing files...")
+        files = list_repo_files(repo)
+        sess['files'] = files
+        if not files: bot.send_message(chat_id, "⚠️ No files found."); sess['step'] = None; return
+        send_numbered_list(chat_id, files, title="Files in Repo")
+        bot.send_message(chat_id, "➡️ Send *file number* or *path* to edit.")
+        return
+
+    if sess.get('step') == 'select_file':
+        file_path = text
+        if text.isdigit() and 1 <= int(text) <= len(sess['files']):
+            file_path = sess['files'][int(text) - 1]
+        try:
+            file_data = sess['repo'].get_contents(file_path)
+            sess.update({'file_path': file_path, 'file_sha': file_data.sha, 'step': 'edit_file'})
+            content = file_data.decoded_content.decode('utf-8', 'ignore')
+            bot.send_message(chat_id, f"*Current content of `{file_path}`:*\n\n```\n{content[:3500]}\n```")
+            bot.send_message(chat_id, "✏️ Send new text or upload a file to replace.")
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Error reading file `{file_path}`:\n`{e}`")
+        return
+
+    if sess.get('step') == 'edit_file':
+        try:
+            sess['repo'].update_file(sess['file_path'], f"Updated via Telegram", text, sess['file_sha'])
+            bot.send_message(chat_id, f"✅ File `{sess['file_path']}` updated!")
+            sess['step'] = None
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Failed to update file:\n`{e}`")
+        return
+
+    # --- JSON Converter Workflow (NEW!) ---
+    if sess.get('step') == 'awaiting_json_text_or_file':
+        accounts = extract_uid_password_pairs(text)
+        if not accounts:
+            bot.send_message(chat_id, "⚠️ Could not find any `uid`/`password` pairs in the text.")
+            return
+        filename = f"converted_{chat_id}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(accounts, f, indent=4)
+        with open(filename, "rb") as f:
+            bot.send_document(message.chat.id, f, caption=f"✅ Extracted {len(accounts)} accounts.")
+        os.remove(filename)
+        sess['step'] = None
+        return
+
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    chat_id = message.chat.id
+    sess = get_session(chat_id)
+    doc = message.document
+    file_info = bot.get_file(doc.file_id)
+    data = bot.download_file(file_info.file_path)
+
+    # --- GitHub Editor Workflow ---
+    if sess.get('step') == 'edit_file':
+        try:
+            text = data.decode('utf-8')
+            sess['repo'].update_file(sess['file_path'], f"Updated via upload", text, sess['file_sha'])
+            bot.send_message(chat_id, f"✅ File `{sess['file_path']}` updated via upload.")
+            sess['step'] = None
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Update failed:\n`{e}`")
+        return
+
+    # --- JWT Generator Workflow ---
+    if sess.get('step') == 'awaiting_jwt_json' and doc.file_name.lower().endswith('.json'):
+        msg = bot.send_message(chat_id, "✅ JSON received! Generating JWTs...")
+        try:
+            accounts = json.loads(data.decode('utf-8'))
+            if not isinstance(accounts, list):
+                bot.edit_message_text("❌ Error: JSON must be a list `[...]`.", chat_id, msg.message_id); return
+        except Exception as e:
+            bot.edit_message_text(f"❌ Failed to parse JSON: `{e}`", chat_id, msg.message_id); return
+        
+        total = len(accounts)
+        tokens_list = []
+        success_count = 0
+        fail_count = 0
+        
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(fetch_jwt_token, acc) for acc in accounts]
+            for i, future in enumerate(as_completed(futures), 1):
+                result = future.result()
+                if result:
+                    tokens_list.append(result)
+                    success_count += 1
+                else:
+                    fail_count += 1
+                
+                if i % 5 == 0 or i == total:
+                    status_text = (
+                        f"⏳ *Processing JWTs...*\n\n"
+                        f"📊 Progress: {i}/{total}\n"
+                        f"✅ Success: {success_count}\n"
+                        f"❌ Failed: {fail_count}\n"
+                        f"📈 Success Rate: {(success_count/i*100):.1f}%"
+                    )
+                    try: bot.edit_message_text(status_text, chat_id, msg.message_id)
+                    except telebot.apihelper.ApiTelegramException: pass
+        
+        output_filename = f"jwts_{chat_id}.json"
+        with open(output_filename, "w") as f: json.dump(tokens_list, f, indent=4)
+        
+        final_text = (
+            f"✅ *Generation Complete!*\n\n"
+            f"📊 Total Accounts: {total}\n"
+            f"✅ Successful: {success_count}\n"
+            f"❌ Failed: {fail_count}\n"
+            f"📈 Success Rate: {(success_count/total*100):.1f}%"
+        )
+        bot.edit_message_text(final_text, chat_id, msg.message_id)
+        
+        with open(output_filename, "rb") as f: 
+            bot.send_document(chat_id, f, caption=f"🎉 Here are your {success_count} JWT tokens!")
+        os.remove(output_filename)
+        sess['step'] = None
+        return
+
+    # --- JSON Converter Workflow ---
+    if sess.get('step') == 'awaiting_json_text_or_file':
+        content = data.decode('utf-8', 'ignore')
+        accounts = extract_uid_password_pairs(content)
+        if not accounts:
+            bot.send_message(chat_id, "⚠️ No `uid`/`password` pairs found in the file.")
+            return
+        filename = f"converted_{chat_id}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(accounts, f, indent=4)
+        with open(filename, "rb") as f:
+            bot.send_document(message.chat.id, f, caption=f"✅ Extracted {len(accounts)} accounts from file.")
+        os.remove(filename)
+        sess['step'] = None
+        return
+
+    bot.send_message(chat_id, "⚠️ Not sure what to do. Use /start to select a task first.")
+
+@bot.message_handler(content_types=['voice', 'audio'])
+def handle_voice_audio(message):
+    """Handle voice messages and audio files - currently not supported"""
+    chat_id = message.chat.id
+    bot.send_message(
+        chat_id, 
+        "⚠️ *Voice/Audio messages are not supported.*\n\n"
+        "Please send:\n"
+        "• 📝 Text message with account details\n"
+        "• 📄 Text/JSON file\n"
+        "• 🖼️ Image (screenshot of accounts)\n\n"
+        "Voice messages cannot be processed by this bot."
+    )
+
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    """Handle photo/image uploads - extract text using OCR if needed"""
+    chat_id = message.chat.id
+    sess = get_session(chat_id)
     
-    import threading
-    def run_async_loop():
-        loop.run_forever()
+    if sess.get('step') == 'awaiting_json_text_or_file':
+        bot.send_message(
+            chat_id,
+            "📸 *Image received!*\n\n"
+            "⚠️ To extract account details from images, please:\n"
+            "1. Use a text recognition app to convert the image to text\n"
+            "2. Send the text directly, or\n"
+            "3. Send a text/JSON file instead\n\n"
+            "_Image OCR is not currently supported._"
+        )
+        return
     
-    thread = threading.Thread(target=run_async_loop, daemon=True)
-    thread.start()
-    
-    # Start Flask app
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    bot.send_message(
+        chat_id,
+        "🖼️ Image received, but I'm not sure what to do with it.\n"
+        "Please use /start to select a task first."
+    )
+
+# =================================================
+# FLASK SERVER & WEBHOOK (Unchanged)
+# =================================================
+app = Flask(__name__)
+@app.route("/")
+def home(): return "✅ Super-Bot is running!"
+
+@app.route(f"/{BOT_TOKEN}", methods=['POST'])
+def get_message():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "!", 200
+    else:
+        return "Unsupported Media Type", 415
+
+if __name__ == "__main__":
+    print("🤖 Super-Bot is starting with webhooks...")
+    bot.remove_webhook()
+    time.sleep(0.5)
+    bot.set_webhook(url=f"{WEBHOOK_URL}/{BOT_TOKEN}")
+    print(f"Webhook set to {WEBHOOK_URL}")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

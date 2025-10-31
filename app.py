@@ -17,9 +17,21 @@ import atexit
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL") 
 SESSION_FILE = "bot_sessions.json"
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # Admin's Telegram Chat ID
 
 if not BOT_TOKEN:
     raise SystemExit("❗ BOT_TOKEN environment variable not found!")
+
+# Convert ADMIN_CHAT_ID to integer if provided
+if ADMIN_CHAT_ID:
+    try:
+        ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
+        print(f"✅ Admin Chat ID set: {ADMIN_CHAT_ID}")
+    except ValueError:
+        print("⚠️ Invalid ADMIN_CHAT_ID format. Admin check disabled.")
+        ADMIN_CHAT_ID = None
+else:
+    print("⚠️ No ADMIN_CHAT_ID set. Bot will work for everyone.")
 
 # ======================
 # Setup bot
@@ -75,6 +87,29 @@ save_thread.start()
 
 # Save sessions on exit
 atexit.register(save_sessions)
+
+# =================================================
+# ADMIN CHECK FUNCTION
+# =================================================
+def is_admin(chat_id):
+    """Check if user is admin. If no ADMIN_CHAT_ID set, allow everyone."""
+    if ADMIN_CHAT_ID is None:
+        return True  # No admin restriction
+    return chat_id == ADMIN_CHAT_ID
+
+def admin_only(func):
+    """Decorator to restrict commands to admin only"""
+    def wrapper(message):
+        if not is_admin(message.chat.id):
+            bot.send_message(
+                message.chat.id,
+                "🚫 *Access Denied!*\n\n"
+                "This bot is restricted to authorized users only.\n"
+                "Please contact the bot administrator for access."
+            )
+            return
+        return func(message)
+    return wrapper
 
 # =================================================
 # UTILITY FUNCTIONS (All 3 bots combined)
@@ -185,6 +220,7 @@ def extract_uid_password_pairs(text: str):
 # KEYBOARD & COMMANDS
 # =================================================
 @bot.message_handler(commands=['start'])
+@admin_only
 def cmd_start(message):
     chat_id = message.chat.id
     sess = get_session(chat_id)
@@ -206,12 +242,34 @@ def cmd_start(message):
     bot.send_message(chat_id, welcome_text, reply_markup=markup)
 
 @bot.message_handler(commands=['cancel'])
+@admin_only
 def cmd_cancel(message):
     sessions.pop(message.chat.id, None)
     save_sessions()  # Save after clearing session
     bot.send_message(message.chat.id, "✅ Operation cancelled. Press /start to see the menu.")
 
+@bot.message_handler(commands=['myid'])
+def cmd_myid(message):
+    """Show user's chat ID - works for everyone"""
+    chat_id = message.chat.id
+    user_info = message.from_user
+    
+    info_text = (
+        f"👤 *Your Information:*\n\n"
+        f"🆔 Chat ID: `{chat_id}`\n"
+        f"👤 Username: @{user_info.username or 'Not set'}\n"
+        f"📛 Name: {user_info.first_name or ''} {user_info.last_name or ''}\n\n"
+    )
+    
+    if is_admin(chat_id):
+        info_text += "✅ *You are an admin!*"
+    else:
+        info_text += "❌ *You are not an admin.*\n\n_To set up admin access, add your Chat ID to the `ADMIN_CHAT_ID` environment variable._"
+    
+    bot.send_message(chat_id, info_text)
+
 @bot.message_handler(commands=['status'])
+@admin_only
 def cmd_status(message):
     """Show current session status"""
     chat_id = message.chat.id
@@ -239,6 +297,12 @@ def cmd_status(message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback_query(call):
     chat_id = call.message.chat.id
+    
+    # Admin check
+    if not is_admin(chat_id):
+        bot.answer_callback_query(call.id, "🚫 Access Denied!", show_alert=True)
+        return
+    
     sess = get_session(chat_id)
     bot.answer_callback_query(call.id)
 
@@ -291,6 +355,16 @@ def list_github_repos(message):
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     chat_id = message.chat.id
+    
+    # Admin check
+    if not is_admin(chat_id):
+        bot.send_message(
+            chat_id,
+            "🚫 *Access Denied!*\n\n"
+            "This bot is restricted to authorized users only."
+        )
+        return
+    
     text = message.text.strip()
     sess = get_session(chat_id)
 
@@ -362,6 +436,16 @@ def handle_text(message):
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     chat_id = message.chat.id
+    
+    # Admin check
+    if not is_admin(chat_id):
+        bot.send_message(
+            chat_id,
+            "🚫 *Access Denied!*\n\n"
+            "This bot is restricted to authorized users only."
+        )
+        return
+    
     sess = get_session(chat_id)
     doc = message.document
     file_info = bot.get_file(doc.file_id)
@@ -454,6 +538,16 @@ def handle_document(message):
 def handle_voice_audio(message):
     """Handle voice messages and audio files - currently not supported"""
     chat_id = message.chat.id
+    
+    # Admin check
+    if not is_admin(chat_id):
+        bot.send_message(
+            chat_id,
+            "🚫 *Access Denied!*\n\n"
+            "This bot is restricted to authorized users only."
+        )
+        return
+    
     bot.send_message(
         chat_id, 
         "⚠️ *Voice/Audio messages are not supported.*\n\n"
@@ -468,6 +562,16 @@ def handle_voice_audio(message):
 def handle_photo(message):
     """Handle photo/image uploads - extract text using OCR if needed"""
     chat_id = message.chat.id
+    
+    # Admin check
+    if not is_admin(chat_id):
+        bot.send_message(
+            chat_id,
+            "🚫 *Access Denied!*\n\n"
+            "This bot is restricted to authorized users only."
+        )
+        return
+    
     sess = get_session(chat_id)
     
     if sess.get('step') == 'awaiting_json_text_or_file':

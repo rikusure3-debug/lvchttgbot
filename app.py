@@ -293,6 +293,32 @@ def get_file(fid):
         download_name=file_data['name']
     )
 
+
+@app.route('/api/chat/verify/<session_id>', methods=['GET'])
+def verify_session(session_id):
+    """Verify if a session exists and is still valid"""
+    try:
+        if session_id not in sessions:
+            return jsonify({'success': False, 'error': 'Session not found'}), 404
+        
+        # Check if session is too old (more than 24 hours)
+        session_data = sessions[session_id]
+        started = datetime.fromisoformat(session_data['started'])
+        age = datetime.now() - started
+        
+        if age.total_seconds() > 86400:  # 24 hours
+            return jsonify({'success': False, 'error': 'Session expired'}), 404
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'name': session_data.get('name'),
+            'age_hours': round(age.total_seconds() / 3600, 1)
+        })
+    except Exception as e:
+        logger.error(f"Verify error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/chat/poll/<sid>', methods=['GET'])
 def poll(sid):
     if sid in sessions:

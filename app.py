@@ -149,14 +149,30 @@ def init_chat():
         'name': data.get('name', 'Anonymous'),
         'email': data.get('email', ''),
         'started': datetime.now().isoformat(),
-        'last_active': datetime.now().isoformat()
+        'last_active': datetime.now().isoformat(),
+        'initial_page': data.get('page_url', 'Unknown'),
+        'initial_page_title': data.get('page_title', 'Unknown')
     }
     messages[sid] = []
     
     import threading
     threading.Thread(target=cleanup_old_sessions, daemon=True).start()
     
-    logger.info(f"New session: {sid} - {sessions[sid]['name']}")
+    # Send notification to admin
+    page_info = sessions[sid]['initial_page_title']
+    page_url = sessions[sid]['initial_page']
+    notification = (
+        f"🆕 <b>নতুন Chat Session শুরু হয়েছে!</b>\n\n"
+        f"👤 <b>Name:</b> {sessions[sid]['name']}\n"
+        f"📧 <b>Email:</b> {sessions[sid].get('email', 'N/A')}\n"
+        f"📄 <b>Page:</b> {page_info}\n"
+        f"🔗 <b>URL:</b> {page_url}\n\n"
+        f"📋 <b>Session ID:</b> <code>{sid}</code>\n"
+        f"⏰ <b>Time:</b> {datetime.now().strftime('%I:%M %p')}"
+    )
+    threading.Thread(target=send_message, args=(ADMIN_ID, notification), daemon=True).start()
+    
+    logger.info(f"New session: {sid} - {sessions[sid]['name']} from {page_info}")
     
     return jsonify({
         'success': True,
@@ -170,6 +186,8 @@ def send_msg():
         data = request.json
         sid = data.get('session_id')
         msg = data.get('message', '')
+        page_url = data.get('page_url', 'Unknown')
+        page_title = data.get('page_title', 'Unknown')
         
         if not sid or sid not in sessions:
             return jsonify({'success': False, 'error': 'Invalid session'}), 400
@@ -178,7 +196,9 @@ def send_msg():
             'from': 'visitor',
             'message': msg,
             'type': 'text',
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'page_url': page_url,
+            'page_title': page_title
         })
         
         user = sessions[sid]
@@ -186,6 +206,8 @@ def send_msg():
             f"💬 <b>নতুন মেসেজ</b>\n\n"
             f"👤 <b>User:</b> {user['name']}\n"
             f"📧 <b>Email:</b> {user.get('email', 'N/A')}\n"
+            f"📄 <b>Current Page:</b> {page_title}\n"
+            f"🔗 <b>URL:</b> {page_url}\n\n"
             f"💭 <b>Message:</b> {msg}\n\n"
             f"📋 <b>Session:</b> <code>{sid}</code>\n\n"
             f"📝 Reply: <code>{sid}: Your message</code>"
@@ -204,6 +226,8 @@ def upload():
     try:
         sid = request.form.get('session_id')
         msg = request.form.get('message', '')
+        page_url = request.form.get('page_url', 'Unknown')
+        page_title = request.form.get('page_title', 'Unknown')
         
         if not sid or sid not in sessions:
             return jsonify({'success': False, 'error': 'Invalid session'}), 400
@@ -241,7 +265,9 @@ def upload():
             'type': msg_type,
             'file_id': fid,
             'filename': filename,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'page_url': page_url,
+            'page_title': page_title
         })
         
         # Send to admin with actual file
@@ -250,6 +276,8 @@ def upload():
             f"💬 <b>নতুন মেসেজ</b>\n\n"
             f"👤 {user['name']}\n"
             f"📧 {user.get('email', 'N/A')}\n"
+            f"📄 <b>Page:</b> {page_title}\n"
+            f"🔗 {page_url}\n\n"
             f"💭 {msg if msg else '(No message)'}\n\n"
             f"📋 <code>{sid}</code>\n\n"
             f"Reply: <code>{sid}: Your message</code>"
